@@ -23,11 +23,13 @@ class RemoteDetector : ObjectDetector {
     companion object {
         private const val TAG = "RemoteDetector"
 
-        // ★ PC의 WiFi/이더넷 IPv4 주소로 변경하세요
-        const val SERVER_URL = "http://192.168.75.218:8000/detect"
+        // ★ ngrok URL (서버 재시작 시 터미널 출력값으로 교체)
+        const val SERVER_URL = "https://ungloved-grill-unlovely.ngrok-free.dev/detect"
 
-        /** 전송할 JPEG 압축 품질 (0~100). 낮을수록 빠르지만 정확도 저하 */
-        private const val JPEG_QUALITY = 75
+        /** 전송할 JPEG 압축 품질 (0~100) */
+        private const val JPEG_QUALITY = 60
+        /** 전송 전 리사이즈 — 긴 변 기준 픽셀 수 (서버 imgsz=416 이므로 640이면 충분) */
+        private const val MAX_SIDE = 640
     }
 
     private val client = OkHttpClient.Builder()
@@ -38,15 +40,26 @@ class RemoteDetector : ObjectDetector {
 
     override fun detect(bitmap: Bitmap, rotationDegrees: Int): List<Detection> {
         return try {
-            // 1) 회전 보정 — 카메라는 보통 90도 회전된 상태로 프레임을 줌
+            // 1) 회전 보정
             val corrected = if (rotationDegrees != 0) {
                 val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
                 Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
             } else bitmap
 
-            // 2) Bitmap → JPEG 바이트
+            // 2) 리사이즈 — 긴 변을 MAX_SIDE 이하로 축소 (전송 속도 향상)
+            val scale = MAX_SIDE.toFloat() / maxOf(corrected.width, corrected.height)
+            val toSend = if (scale < 1f)
+                Bitmap.createScaledBitmap(
+                    corrected,
+                    (corrected.width  * scale).toInt(),
+                    (corrected.height * scale).toInt(),
+                    false
+                )
+            else corrected
+
+            // 3) Bitmap → JPEG 바이트
             val stream = ByteArrayOutputStream()
-            corrected.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, stream)
+            toSend.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, stream)
             val jpegBytes = stream.toByteArray()
 
             // 2) Multipart POST 전송
@@ -96,8 +109,15 @@ class RemoteDetector : ObjectDetector {
                     box.getDouble(2).toFloat(),  // x2
                     box.getDouble(3).toFloat()   // y2
                 )
+                // depth_m: null 이면 서버 depth 모델 미로드 상태
+                val depthM = if (obj.isNull("depth_m")) null
+                             else obj.optDouble("depth_m", 0.0).toFloat()
+                // group / approach_speed (접근 속도 기반 경고용)
+                val group = obj.optString("group").takeIf { it.isNotEmpty() && it != "null" }
+                val approachSpeed = if (obj.isNull("approach_speed")) null
+                                    else obj.optDouble("approach_speed", 0.0).toFloat()
                 // label_ko 를 label 필드에 담아서 앱에서 바로 출력
-                result.add(Detection(labelKo, confidence, rect))
+                result.add(Detection(labelKo, confidence, rect, depthM, group, approachSpeed))
             }
         } catch (e: Exception) {
             Log.e(TAG, "JSON 파싱 실패: ${e.message}")

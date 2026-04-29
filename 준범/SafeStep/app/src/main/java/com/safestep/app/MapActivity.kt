@@ -43,6 +43,7 @@ import com.safestep.app.detect.Detection
 import com.safestep.app.detect.ObjectDetector
 import com.safestep.app.detect.RemoteDetector
 import com.safestep.app.detect.SegmentationClient
+import com.safestep.app.detect.SignalClient
 import com.safestep.app.navigation.NavigationGuide
 import com.safestep.app.navigation.PoiResult
 import com.safestep.app.navigation.RouteResult
@@ -74,13 +75,17 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var navInstruction: TextView
     private lateinit var navDistance: TextView
     private lateinit var navStepCount: TextView
+    private lateinit var backToModeButton: Button
 
     // ── Core ──────────────────────────────────────────────────────────────────
     private lateinit var tts: TextToSpeech
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var segExecutor: ExecutorService    // 세그멘테이션 전용 스레드
+    private lateinit var signalExecutor: ExecutorService // 신호등 전용 스레드
     private var vibrator: Vibrator? = null
     private lateinit var detector: ObjectDetector
     private lateinit var segClient: SegmentationClient
+    private lateinit var signalClient: SignalClient
 
     // ── Location ──────────────────────────────────────────────────────────────
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -102,6 +107,12 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     // ── Navigation ────────────────────────────────────────────────────────────
     private lateinit var navGuide: NavigationGuide
     private var totalSteps = 0
+    /** 전체 경로 포인트 (잔여 경로 업데이트 + 이탈 감지용) */
+    private var allPathPoints: List<org.osmdroid.util.GeoPoint> = emptyList()
+    /** 재탐색용 목적지 저장 */
+    private var currentDest: PoiResult? = null
+    /** 경로 이탈 경고 마지막 시각 */
+    @Volatile private var lastOffRouteWarnMs = 0L
 
     // ── Speech ────────────────────────────────────────────────────────────────
     private var speechRecognizer: SpeechRecognizer? = null
@@ -112,16 +123,46 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     @Volatile private var lastSurfaceStatus = ""
     @Volatile private var lastSurfaceSpeakMs = 0L
 
+    // ── Signal (신호등) ────────────────────────────────────────────────────────
+    @Volatile private var lastTrafficLightStatus: String? = "init"  // 최초 발화 방지
+
+    // ── Surface zones (3구역 회피 방향) ──────────────────────────────────────
+    @Volatile private var lastZones: Map<String, String> = emptyMap()
+
+    // ── Area-growth 접근 속도 (서버 depth 없을 때 fallback) ───────────────
+    // label → deque of (area, elapsedMs)
+    private val areaHistory = mutableMapOf<String, ArrayDeque<Pair<Float, Long>>>()
+
     // ── Detection ─────────────────────────────────────────────────────────────
     @Volatile private var lastSpoken = ""
     @Volatile private var lastSpeakMs = 0L
+    /** 보행 모드: 앱 시작부터 장애물 TTS 활성화 (목적지 없어도 경고) */
+    @Volatile private var detectionTtsEnabled = true
+    /** 가속도계 기반 이동 여부 — false 이면 배터리 절약 모드 */
+    @Volatile private var isMoving = true
+    private var stationaryCount = 0
+    private var linearAccelSensor: Sensor? = null
 
     companion object {
-        private const val TAG        = "MapActivity"
-        private const val REQ_PERM   = 200
-        private const val DANGER_AREA      = 0.20f
-        private const val VERY_CLOSE_AREA  = 0.40f
-        private const val SPEAK_COOLDOWN_MS = 2500L
+        private const val TAG               = "MapActivity"
+        private const val REQ_PERM          = 200
+        private const val DANGER_AREA       = 0.20f
+        private const val VERY_CLOSE_AREA   = 0.40f
+        private const val SPEAK_COOLDOWN_MS = 2000L
+
+        // 서버 depth 기반 접근 속도 임계값 (m/s)
+        private val GROUP_SPEED_THRESH = mapOf(
+            "vehicle" to 0.3f, "micro" to 1.2f, "person" to 2.0f
+        )
+        // depth fallback 임계값 (m)
+        private val GROUP_DEPTH_THRESH = mapOf(
+            "vehicle" to 4.0f, "micro" to 2.5f, "person" to 2.0f
+        )
+        // 클라이언트 면적 증가율 임계값 (화면 비율/초)
+        private val AREA_GROW_THRESH = mapOf(
+            "vehicle" to 0.04f, "micro" to 0.03f, "person" to 0.02f
+        )
+
         private val PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -150,18 +191,28 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         navInstruction  = findViewById(R.id.navInstruction)
         navDistance     = findViewById(R.id.navDistance)
         navStepCount    = findViewById(R.id.navStepCount)
+        backToModeButton = findViewById(R.id.backToModeButton)
+
+        backToModeButton.setOnClickListener {
+            startActivity(Intent(this, SplashActivity::class.java))
+            finish()
+        }
 
         tts            = TextToSpeech(this, this)
         @Suppress("DEPRECATION")
         vibrator       = getSystemService(VIBRATOR_SERVICE) as Vibrator
         cameraExecutor = Executors.newSingleThreadExecutor()
+        segExecutor    = Executors.newSingleThreadExecutor()
+        signalExecutor = Executors.newSingleThreadExecutor()
         detector       = ObjectDetector.create(this)
         segClient      = SegmentationClient(RemoteDetector.SERVER_URL)
+        signalClient   = SignalClient(RemoteDetector.SERVER_URL)
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
-        // 나침반 센서
+        // 나침반 + 이동 감지 센서
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-        rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        rotationSensor    = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        linearAccelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
 
         navGuide = NavigationGuide(tts).apply {
             onStepChanged = { step ->
@@ -184,17 +235,23 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         rotationSensor?.let {
             sensorManager.registerListener(compassListener, it, SensorManager.SENSOR_DELAY_UI)
         }
+        linearAccelSensor?.let {
+            sensorManager.registerListener(motionListener, it, SensorManager.SENSOR_DELAY_NORMAL)
+        }
     }
 
     override fun onPause() {
         super.onPause()
         mapView.onPause()
         sensorManager.unregisterListener(compassListener)
+        sensorManager.unregisterListener(motionListener)
     }
 
     override fun onDestroy() {
         mapView.onDetach()
         cameraExecutor.shutdown()
+        segExecutor.shutdown()
+        signalExecutor.shutdown()
         tts.shutdown()
         speechRecognizer?.destroy()
         if (::fusedLocationClient.isInitialized && ::locationCallback.isInitialized)
@@ -214,6 +271,24 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val az = Math.toDegrees(orientVals[0].toDouble()).toFloat()
             currentAzimuth = (az + 360f) % 360f
             mapView.setMapOrientation(-currentAzimuth)
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    /** 선형 가속도 기반 이동/정지 판단 — 정지 시 detection 주기 줄여 배터리 절약 */
+    private val motionListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            val mag = Math.sqrt(
+                (event.values[0] * event.values[0] +
+                 event.values[1] * event.values[1] +
+                 event.values[2] * event.values[2]).toDouble()
+            ).toFloat()
+            if (mag > 0.6f) {          // 움직임 감지
+                stationaryCount = 0
+                isMoving = true
+            } else if (++stationaryCount > 20) {  // 20샘플 연속 정지 (~2초)
+                isMoving = false
+            }
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
@@ -256,6 +331,8 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun showRouteOnMap(result: RouteResult, dest: PoiResult) {
+        allPathPoints = result.pathPoints   // 전체 경로 저장 (잔여선 + 이탈 감지)
+
         routePolyline?.let { mapView.overlays.remove(it) }
         destMarker?.let    { mapView.overlays.remove(it) }
 
@@ -275,19 +352,9 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         mapView.invalidate()
     }
 
-    // 진행 방향으로 지도 중심 오프셋 (사용자가 화면 하단 1/3에 보이도록)
+    // 사용자 위치를 지도 중앙에 즉시 고정
     private fun centerMapOnUser(loc: Location) {
-        val zoom = mapView.zoomLevelDouble
-        // 줌 레벨별 픽셀당 미터 (위도 보정 포함)
-        val metersPerPx = 156543.03392 *
-                Math.cos(Math.toRadians(loc.latitude)) / Math.pow(2.0, zoom)
-        // 화면 높이의 1/3만큼 진행 방향으로 오프셋
-        val shiftM = (mapView.height / 3.0) * metersPerPx
-        val bearingRad = Math.toRadians(currentAzimuth.toDouble())
-        val dLat = shiftM / 111320.0 * Math.cos(bearingRad)
-        val dLon = shiftM / (111320.0 * Math.cos(Math.toRadians(loc.latitude))) *
-                Math.sin(bearingRad)
-        mapView.controller.animateTo(GeoPoint(loc.latitude + dLat, loc.longitude + dLon))
+        mapView.controller.setCenter(GeoPoint(loc.latitude, loc.longitude))
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -301,10 +368,9 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 currentLocation = loc
                 navGuide.updateLocation(loc.latitude, loc.longitude)
 
-                // 지도 중심 이동 (진행 방향 기준 오프셋)
+                // 지도 중앙 고정
                 centerMapOnUser(loc)
 
-                // 내비 중 줌 자동 조정
                 if (navGuide.isRunning()) {
                     val dist = navGuide.distToCurrentStep(loc.latitude, loc.longitude)
                     val zoom = when {
@@ -321,6 +387,12 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         navDistance.text = formatDist(dist)
                         if (step != null) navInstruction.text = step.description
                     }
+
+                    // 잔여 경로선 업데이트
+                    updateRemainingRoute(loc.latitude, loc.longitude)
+
+                    // 경로 이탈 감지
+                    checkOffRoute(loc.latitude, loc.longitude)
                 }
             }
         }
@@ -411,6 +483,8 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun handleDestinationQuery(query: String) {
         destinationText.text = "\"$query\" 검색 중…"
+        // 목적지 인식 시점부터 장애물 경고 TTS 활성화
+        detectionTtsEnabled = true
         tts.speak("$query 검색합니다.", TextToSpeech.QUEUE_FLUSH, null, "searching")
 
         TmapService.searchPoi(query) { pois ->
@@ -434,6 +508,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun fetchRoute(sLat: Double, sLon: Double, dest: PoiResult) {
+        currentDest = dest   // 재탐색용 저장
         TmapService.searchPedestrianRoute(sLat, sLon, dest.lat, dest.lon, dest.name) { result ->
             if (result == null || result.steps.isEmpty()) {
                 tts.speak("경로를 찾을 수 없습니다.", TextToSpeech.QUEUE_FLUSH, null, "no-route")
@@ -512,16 +587,39 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     @OptIn(ExperimentalGetImage::class)
     private fun analyzeFrame(imageProxy: ImageProxy) {
         try {
+            frameCount++
+
+            // 배터리 절약: 정지 중이면 3프레임에 1번만 처리
+            if (!isMoving && frameCount % 3 != 0) {
+                imageProxy.close()
+                return
+            }
+
             val bitmap   = imageProxy.toBitmap()
             val rotation = imageProxy.imageInfo.rotationDegrees
 
+            // ① 탐지 — 메인 카메라 스레드
             val detections = detector.detect(bitmap, rotation)
             handleDetections(detections)
 
-            frameCount++
+            // ② 세그멘테이션 — 2프레임마다, 별도 스레드 (탐지 블로킹 없음)
             if (frameCount % 2 == 0) {
-                val seg = segClient.segment(bitmap, rotation)
-                if (seg != null) handleSegmentation(seg)
+                segExecutor.execute {
+                    try {
+                        val seg = segClient.segment(bitmap, rotation)
+                        if (seg != null) handleSegmentation(seg)
+                    } catch (e: Exception) { Log.w(TAG, "세그멘테이션 실패: ${e.message}") }
+                }
+            }
+
+            // ③ 신호등 — 5프레임마다, 별도 스레드 (탐지 블로킹 없음)
+            if (frameCount % 5 == 0) {
+                signalExecutor.execute {
+                    try {
+                        val signal = signalClient.detect(bitmap, rotation)
+                        handleTrafficLight(signal?.color)
+                    } catch (e: Exception) { Log.w(TAG, "신호등 감지 실패: ${e.message}") }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "프레임 분석 실패", e)
@@ -537,51 +635,279 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun handleDetections(detections: List<Detection>) {
         bboxOverlay.updateDetections(detections)
 
+        // 오래된 면적 히스토리 정리 (5초 이상 미감지 객체)
+        val nowMs = SystemClock.elapsedRealtime()
+        areaHistory.entries.removeAll { (_, h) ->
+            h.isEmpty() || nowMs - h.last().second > 5_000L
+        }
+
+        // 화면 중심 가중 점수로 가장 위험한 객체 선택
         val worst = detections.maxByOrNull { d ->
             val cw = 1f - kotlin.math.abs(d.centerX() - 0.5f)
             d.area() * (0.7f + 0.3f * cw) * d.confidence
         } ?: return
 
-        val isPerson  = worst.label in listOf("사람", "person")
-        val threshold = if (isPerson) 0.60f else DANGER_AREA
-        if (worst.area() < threshold) return
+        val grp        = worst.group
+        val speedDepth = worst.approachSpeed          // 서버 depth 기반
+        val speedArea  = areaGrowthRate(worst.label, worst.area())  // 클라이언트 면적 기반
 
-        val side = when {
-            worst.centerX() < 0.33f -> "왼쪽"
-            worst.centerX() > 0.66f -> "오른쪽"
-            else                     -> "정면"
+        // ── 경고 여부 판단 ────────────────────────────────────────────────────
+        val shouldWarn = when {
+            grp == null ->
+                worst.area() >= DANGER_AREA           // 고정 장애물: 면적 기반
+
+            // 차량: 면적증가율 제외 — 내가 다가가는 것도 증가하므로 오경보 발생
+            // 서버 접근속도 있으면 우선, 없으면 depth 2.5m 이하일 때만 경고
+            grp == "vehicle" -> when {
+                speedDepth != null -> speedDepth >= (GROUP_SPEED_THRESH["vehicle"] ?: 0.3f)
+                worst.depthM != null -> worst.depthM!! < 2.5f
+                else -> worst.area() >= 0.65f         // depth 도 없으면 화면 65% 이상
+            }
+
+            speedDepth != null ->
+                speedDepth >= (GROUP_SPEED_THRESH[grp] ?: 0.3f)   // ① 서버 depth 속도
+
+            speedArea != null ->
+                speedArea >= (AREA_GROW_THRESH[grp] ?: 0.04f)     // ② 클라이언트 면적 증가율
+
+            worst.depthM != null ->
+                worst.depthM!! < (GROUP_DEPTH_THRESH[grp] ?: 3.0f) // ③ depth 거리 임계값
+
+            grp == "person"  -> worst.area() >= 0.60f
+            else             -> worst.area() >= DANGER_AREA
         }
-        val distTag = if (worst.area() >= VERY_CLOSE_AREA) "매우 가까이 " else ""
-        val msg = "$side $distTag${worst.label} 접근"
-        showWarning(msg, side)
+        if (!shouldWarn) return
+
+        // ── 방향 판단 ─────────────────────────────────────────────────────────
+        val cx = worst.centerX()
+        val side = when {
+            cx < 0.33f -> "왼쪽"
+            cx > 0.66f -> "오른쪽"
+            else        -> "정면"
+        }
+
+        // ── 메시지 빌드 ───────────────────────────────────────────────────────
+        // displayMsg: UI 배너 (거리 포함, 상세)
+        val distTag    = if (worst.depthM != null) worst.distStr() + " " else ""
+        val displayMsg = "$side $distTag${worst.label} 접근"
+
+        // spokenMsg: TTS (거리 제외, 짧게, 회피 방향 합산)
+        val dodge     = buildDodgeHint(side)
+        val dodgeShort = dodgeHintShort(dodge)
+        val spokenMsg = if (dodgeShort != null) "$side ${worst.label}, $dodgeShort"
+                        else "$side ${worst.label}"
+
+        showWarning(displayMsg, spokenMsg, side)
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 신호등 상태 처리 — 상태 변화 시에만 TTS
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    private fun handleTrafficLight(color: String?) {
+        if (color == lastTrafficLightStatus) return
+        lastTrafficLightStatus = color
+        val msg = when (color) {
+            "red"      -> "빨간불입니다. 멈추세요."
+            "green"    -> "초록불입니다. 건너도 됩니다."
+            "blinking" -> "초록불이 깜빡입니다. 서두르세요."
+            else       -> return  // null → 신호등 없음, 발화 안 함
+        }
+        tts.speak(msg, TextToSpeech.QUEUE_ADD, null, "tl-$color")
     }
 
     private fun handleSegmentation(seg: com.safestep.app.detect.SegmentResult) {
         runOnUiThread { segmentOverlay.setImageBitmap(seg.maskBitmap) }
 
-        val status  = seg.status
+        // 3구역 정보 저장 (회피 방향 판단에 사용)
+        if (seg.zones.isNotEmpty()) lastZones = seg.zones
+
+        // 계단 감지 — 최우선 즉시 경고 (상태 변화 무관)
+        if (seg.isStairs) {
+            if (lastSurfaceStatus != "stairs") {
+                lastSurfaceStatus = "stairs"
+                tts.speak("계단이 있습니다. 조심하세요.", TextToSpeech.QUEUE_FLUSH, null, "stairs-warn")
+            }
+            return
+        }
+
+        val status = seg.status
         if (status == lastSurfaceStatus) return   // 상태 변화 없으면 무시
         lastSurfaceStatus = status
 
         when (status) {
-            "road"    -> tts.speak("차도입니다. 주의하세요.",     TextToSpeech.QUEUE_ADD, null, "road-warn")
+            "road" -> {
+                // 내비 중이면 어느 쪽 보도로 갈지 방향 힌트 포함
+                val msg = if (navGuide.isRunning()) {
+                    val lDanger = zoneDanger(seg.zones["left"]  ?: "unknown")
+                    val rDanger = zoneDanger(seg.zones["right"] ?: "unknown")
+                    when {
+                        lDanger < rDanger -> "차도입니다. 왼쪽 보도로 이동하세요."
+                        rDanger < lDanger -> "차도입니다. 오른쪽 보도로 이동하세요."
+                        else              -> "차도입니다. 보도로 이동하세요."
+                    }
+                } else "차도입니다. 주의하세요."
+                tts.speak(msg, TextToSpeech.QUEUE_ADD, null, "road-warn")
+            }
             "caution" -> tts.speak("위험 구역입니다. 주의하세요.", TextToSpeech.QUEUE_ADD, null, "caution-warn")
             "alley"   -> tts.speak("골목길입니다. 주의하세요.",   TextToSpeech.QUEUE_ADD, null, "alley-warn")
         }
     }
 
-    private fun showWarning(message: String, side: String) {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 3구역 회피 방향 판단
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 클라이언트 면적 증가율 (서버 depth 없을 때 접근 속도 fallback)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /**
+     * 동일 라벨 bbox 면적의 시간당 변화율 (화면 비율/초).
+     * 양수 = 커지는 중 = 접근, 충분한 샘플(≥3)이 쌓일 때까지 null.
+     */
+    private fun areaGrowthRate(label: String, area: Float): Float? {
+        val hist = areaHistory.getOrPut(label) { ArrayDeque() }
+        val now  = SystemClock.elapsedRealtime()
+        hist.addLast(area to now)
+        while (hist.size > 8) hist.removeFirst()
+        // 3초보다 오래된 샘플 제거
+        while (hist.size > 1 && now - hist.first().second > 3_000L) hist.removeFirst()
+        if (hist.size < 3) return null
+        val dt = (now - hist.first().second) / 1000f
+        if (dt < 0.15f) return null
+        return (area - hist.first().first) / dt
+    }
+
+    /** 회피 방향 TTS를 짧은 형태로 변환 ("오른쪽으로" 등) */
+    private fun dodgeHintShort(hint: String?): String? = when {
+        hint == null                      -> null
+        hint.contains("오른쪽으로 조심히") -> "오른쪽 조심"
+        hint.contains("왼쪽으로 조심히")  -> "왼쪽 조심"
+        hint.contains("오른쪽")          -> "오른쪽으로"
+        hint.contains("왼쪽")            -> "왼쪽으로"
+        hint.contains("멈추세요")         -> "멈춰"
+        else                             -> null
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 내비게이션 유틸
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /** 위경도 간 평면 근사 거리 (m) — 수백 m 이내 정확 */
+    private fun distLatLon(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val dLat = (lat2 - lat1) * 111320.0
+        val dLon = (lon2 - lon1) * 111320.0 * Math.cos(Math.toRadians(lat1))
+        return Math.sqrt(dLat * dLat + dLon * dLon)
+    }
+
+    /**
+     * 사용자와 가장 가까운 경로 포인트 이후 구간만 폴리라인에 남김.
+     * GPS 이동에 따라 지나온 선이 사라지는 효과.
+     */
+    private fun updateRemainingRoute(lat: Double, lon: Double) {
+        val pts = allPathPoints
+        if (pts.size < 2) return
+
+        // 가장 가까운 포인트 인덱스 탐색
+        var nearestIdx = 0
+        var minDist = Double.MAX_VALUE
+        for (i in pts.indices) {
+            val d = distLatLon(lat, lon, pts[i].latitude, pts[i].longitude)
+            if (d < minDist) { minDist = d; nearestIdx = i }
+        }
+
+        val remaining = pts.subList(nearestIdx, pts.size)
         runOnUiThread {
-            warningText.text = message
+            routePolyline?.setPoints(remaining)
+            mapView.invalidate()
+        }
+    }
+
+    /**
+     * 경로 이탈 감지 — 경로상 모든 포인트와의 최소 거리가 40m 초과 시 TTS 경고 + 자동 재탐색.
+     * 20초 쿨다운 적용.
+     */
+    private fun checkOffRoute(lat: Double, lon: Double) {
+        val pts = allPathPoints
+        if (pts.isEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastOffRouteWarnMs < 20_000L) return
+
+        val minDist = pts.minOf { p -> distLatLon(lat, lon, p.latitude, p.longitude) }
+        if (minDist > 40.0) {
+            lastOffRouteWarnMs = now
+            tts.speak("경로를 벗어났습니다. 경로를 재탐색합니다.", TextToSpeech.QUEUE_FLUSH, null, "off-route")
+            val dest = currentDest ?: return
+            fetchRoute(lat, lon, dest)
+        }
+    }
+
+    /** 노면 카테고리의 위험도 점수 (높을수록 위험) */
+    private fun zoneDanger(cat: String): Int = when (cat) {
+        "caution"   -> 3
+        "road"      -> 2
+        "alley"     -> 1
+        "crosswalk" -> 1
+        "sidewalk"  -> 0
+        else        -> 0   // unknown
+    }
+
+    /**
+     * 장애물이 있는 방향을 받아 반대쪽 구역 안전도를 확인하고 회피 TTS 문자열 반환.
+     * 구역 정보가 없으면 null (발화 안 함).
+     */
+    private fun buildDodgeHint(obstacleSide: String): String? {
+        val zones = lastZones
+        if (zones.isEmpty()) return null
+
+        val leftDanger  = zoneDanger(zones["left"]   ?: "unknown")
+        val rightDanger = zoneDanger(zones["right"]  ?: "unknown")
+
+        return when (obstacleSide) {
+            "왼쪽" -> when {
+                rightDanger == 0 -> "오른쪽으로 피하세요."
+                rightDanger == 1 -> "오른쪽으로 조심히 피하세요."
+                else             -> "멈추세요."
+            }
+            "오른쪽" -> when {
+                leftDanger == 0  -> "왼쪽으로 피하세요."
+                leftDanger == 1  -> "왼쪽으로 조심히 피하세요."
+                else             -> "멈추세요."
+            }
+            else -> when {   // 정면
+                leftDanger < rightDanger  -> "왼쪽으로 피하세요."
+                rightDanger < leftDanger  -> "오른쪽으로 피하세요."
+                leftDanger == 0           -> "왼쪽으로 피하세요."
+                else                      -> "멈추세요."
+            }
+        }
+    }
+
+    /**
+     * @param displayMsg UI 배너에 표시할 전체 메시지 (거리 포함)
+     * @param spokenMsg  TTS로 읽을 짧은 메시지 (거리 제외, 회피 방향 합산)
+     */
+    private fun showWarning(displayMsg: String, spokenMsg: String, side: String) {
+        // 바운딩박스 배너는 항상 표시
+        runOnUiThread {
+            warningText.text = displayMsg
             warningBanner.visibility = View.VISIBLE
         }
-        val now = SystemClock.elapsedRealtime()
-        if (message != lastSpoken || now - lastSpeakMs >= SPEAK_COOLDOWN_MS) {
-            lastSpoken  = message
-            lastSpeakMs = now
-            tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "warn-$now")
+
+        // 목적지 미설정 또는 음성인식 중이면 TTS/진동 억제
+        if (!detectionTtsEnabled || isListening) {
+            warningBanner.postDelayed({ runOnUiThread { warningBanner.visibility = View.GONE } }, 3_000)
+            return
         }
-        vibrateForDirection(side)
+
+        val now = SystemClock.elapsedRealtime()
+        if (spokenMsg != lastSpoken || now - lastSpeakMs >= SPEAK_COOLDOWN_MS) {
+            lastSpoken  = spokenMsg
+            lastSpeakMs = now
+            // 진동 + TTS 동시에
+            vibrateForDirection(side)
+            tts.speak(spokenMsg, TextToSpeech.QUEUE_FLUSH, null, "warn-$now")
+        }
         warningBanner.postDelayed({ runOnUiThread { warningBanner.visibility = View.GONE } }, 3_000)
     }
 
@@ -602,6 +928,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts.language = Locale.KOREAN
+            tts.setSpeechRate(1.5f)   // 빠르게 읽기
             tts.speak(
                 "SafeStep 시작됩니다. 마이크 버튼을 눌러 목적지를 말씀해주세요.",
                 TextToSpeech.QUEUE_FLUSH, null, "intro"

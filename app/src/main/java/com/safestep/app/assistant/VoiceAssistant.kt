@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Vibrator
 import android.os.VibrationEffect
 import android.os.Build
@@ -13,7 +15,6 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.Log
-import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import androidx.core.app.ActivityCompat
@@ -89,15 +90,22 @@ class VoiceAssistant(
         }
     }
 
-    /** 화면(또는 특정 뷰)에 long press 리스너 부착. */
+    /** 화면(또는 특정 뷰)에 long press 리스너 부착. (1.5초 유지 시 활성화) */
     fun attachLongPressTo(view: View) {
-        val detector = GestureDetector(activity, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onLongPress(e: MotionEvent) {
-                onLongPressTriggered()
-            }
-        })
+        val handler = Handler(Looper.getMainLooper())
+        var pendingRunnable: Runnable? = null
+
         view.setOnTouchListener { v, ev ->
-            detector.onTouchEvent(ev)
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    pendingRunnable = Runnable { onLongPressTriggered() }
+                    handler.postDelayed(pendingRunnable!!, LONG_PRESS_MS)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    pendingRunnable?.let { handler.removeCallbacks(it) }
+                    pendingRunnable = null
+                }
+            }
             v.performClick()
             false  // 다른 터치 핸들러 동작 방해 안 함
         }
@@ -178,9 +186,17 @@ class VoiceAssistant(
         inFlight = scope.launch {
             val action = try {
                 withContext(Dispatchers.IO) { client.ask(text, ctx) }
+            } catch (e: AssistantClient.ApiKeyException) {
+                Log.e(TAG, "API 키 미설정", e)
+                speak("서버에 API 키가 설정되지 않았습니다. 서버 관리자에게 문의하세요.")
+                return@launch
+            } catch (e: AssistantClient.ServerException) {
+                Log.e(TAG, "서버 오류: ${e.code}", e)
+                speak("서버 오류가 발생했습니다. 잠시 후 다시 시도하세요.")
+                return@launch
             } catch (e: Exception) {
                 Log.e(TAG, "서버 호출 실패", e)
-                speak("서버에 연결할 수 없습니다.")
+                speak("서버에 연결할 수 없습니다. URL 설정을 확인해주세요.")
                 return@launch
             }
             // tts 발화 + 앱 핸들러 호출 (둘 다 UI 스레드)
@@ -205,7 +221,8 @@ class VoiceAssistant(
     }
 
     companion object {
-        private const val TAG     = "VoiceAssistant"
-        private const val REQ_MIC = 9201
+        private const val TAG           = "VoiceAssistant"
+        private const val REQ_MIC       = 9201
+        private const val LONG_PRESS_MS = 1500L   // 오작동 방지: 기본 500ms → 1.5초
     }
 }

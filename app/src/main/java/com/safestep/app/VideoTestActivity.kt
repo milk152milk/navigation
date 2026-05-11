@@ -23,6 +23,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.safestep.app.detect.Detection
 import com.safestep.app.detect.ObjectDetector
+import com.safestep.app.detect.SignalClient
+import com.safestep.app.detect.SignalResult
 import java.util.Locale
 
 class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
@@ -36,16 +38,21 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var detectionStatus: TextView
     private lateinit var selectVideoButton: Button
     private lateinit var playPauseButton: Button
+    private lateinit var signalInfoCard: LinearLayout
+    private lateinit var signalDistText: TextView
+    private lateinit var signalSafeText: TextView
 
     // ── Core ──────────────────────────────────────────────────────────────────
     private lateinit var tts: TextToSpeech
     private lateinit var detector: ObjectDetector
     private lateinit var segClient: SegmentationClient
+    private lateinit var signalClient: SignalClient
     private lateinit var segmentOverlay: ImageView
     private var vibrator: Vibrator? = null
     @Volatile private var frameCount = 0
     @Volatile private var lastSurfaceStatus = ""
     @Volatile private var lastSurfaceSpeakMs = 0L
+    @Volatile private var lastSignalColor: String? = null
 
     // ── 프레임 추출 타이머 ─────────────────────────────────────────────────────
     private val frameHandler = Handler(Looper.getMainLooper())
@@ -91,7 +98,11 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tts          = TextToSpeech(this, this)
         detector     = ObjectDetector.create(this)
         segClient    = SegmentationClient(RemoteDetector.SERVER_URL)
-        segmentOverlay = findViewById(R.id.segmentOverlay)
+        signalClient = SignalClient(RemoteDetector.SERVER_URL)
+        segmentOverlay  = findViewById(R.id.segmentOverlay)
+        signalInfoCard  = findViewById(R.id.signalInfoCard)
+        signalDistText  = findViewById(R.id.signalDistText)
+        signalSafeText  = findViewById(R.id.signalSafeText)
         @Suppress("DEPRECATION")
         vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
 
@@ -125,7 +136,8 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (videoView.isPlaying) pauseVideo() else playVideo()
         }
 
-        findViewById<Button>(R.id.backButton).setOnClickListener {
+        // 좌상단 뒤로가기 버튼 (카메라 모드와 동일한 위치)
+        findViewById<android.view.View>(R.id.backToModeButton).setOnClickListener {
             startActivity(Intent(this, SplashActivity::class.java))
             finish()
         }
@@ -217,13 +229,16 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 if (bitmap != null) {
                     val detections = detector.detect(bitmap, 0)
 
-                    // 세그멘테이션 (2프레임마다)
                     frameCount++
+                    // 세그멘테이션 (2프레임마다)
                     val seg = if (frameCount % 2 == 0) segClient.segment(bitmap, 0) else null
+                    // 신호등 (3프레임마다)
+                    val signal = if (frameCount % 3 == 0) signalClient.detect(bitmap, 0) else null
 
                     runOnUiThread {
                         handleDetections(detections)
                         if (seg != null) handleSegmentation(seg)
+                        if (signal != null) handleSignal(signal)
                         isDetecting = false
                     }
                 } else {
@@ -306,6 +321,39 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         vibrator?.vibrate(VibrationEffect.createWaveform(pattern, -1))
 
         warningBanner.postDelayed({ warningBanner.visibility = View.GONE }, 3_000)
+    }
+
+    private fun handleSignal(result: SignalResult) {
+        val color = result.color
+        val conf  = result.confidence ?: 0f
+
+        // UI 카드
+        if (color == null || conf < 0.4f) {
+            signalInfoCard.visibility = View.GONE
+            return
+        }
+        val (emoji, label, bgColor) = when (color) {
+            "red"      -> Triple("🔴", "빨간불", 0xCCCC2222.toInt())
+            "green"    -> Triple("🟢", "초록불", 0xCC227722.toInt())
+            "blinking" -> Triple("🟡", "점멸",  0xCCCC8800.toInt())
+            else       -> return
+        }
+        signalInfoCard.setBackgroundColor(bgColor)
+        signalDistText.text = "$emoji $label"
+        signalSafeText.text = "신뢰도 ${(conf * 100).toInt()}%"
+        signalInfoCard.visibility = View.VISIBLE
+
+        // 색이 바뀔 때만 TTS
+        if (color != lastSignalColor) {
+            lastSignalColor = color
+            val msg = when (color) {
+                "red"      -> "빨간불입니다."
+                "green"    -> "초록불입니다."
+                "blinking" -> "초록불이 깜빡입니다."
+                else       -> return
+            }
+            tts.speak(msg, TextToSpeech.QUEUE_ADD, null, "sig-$color")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════

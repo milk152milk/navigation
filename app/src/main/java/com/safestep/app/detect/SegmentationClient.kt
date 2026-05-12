@@ -3,7 +3,6 @@ package com.safestep.app.detect
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
@@ -76,23 +75,15 @@ class SegmentationClient(serverUrl: String) {
                     bytes.toRequestBody("image/jpeg".toMediaType()))
                 .build()
 
-            val req   = Request.Builder().url(segmentUrl).post(body).build()
-            val t0    = SystemClock.elapsedRealtime()
-            val resp  = client.newCall(req).execute()
-            val rttMs = SystemClock.elapsedRealtime() - t0
+            val req = Request.Builder().url(segmentUrl).post(body).build()
+            val resp = client.newCall(req).execute()
 
             if (!resp.isSuccessful) {
                 Log.w(TAG, "서버 응답 실패: ${resp.code}")
                 return null
             }
 
-            val json    = resp.body?.string() ?: return null
-            val result  = parseResponse(json)
-            val procMs  = try {
-                org.json.JSONObject(json).optLong("proc_ms", -1L).takeIf { it >= 0 }
-            } catch (_: Exception) { null }
-            LatencyTracker.recordSeg(rttMs, procMs)
-            result
+            parseResponse(resp.body?.string() ?: return null)
         } catch (e: Exception) {
             Log.w(TAG, "세그멘테이션 통신 실패: ${e.message}")
             null

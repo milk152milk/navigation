@@ -37,14 +37,15 @@ class NavigationGuide(private val tts: TextToSpeech) {
     var onArrived: (() -> Unit)? = null
 
     companion object {
-        /** 이 거리 이내면 현재 스텝 지점 통과 → 다음 스텝 전진 */
-        private const val STEP_ARRIVE_M = 20.0
+        /** 이 거리 이내면 현재 스텝 지점 통과 → 다음 스텝 전진
+         *  20→12m: GPS 오차로 인한 조기 스텝 전진 방지 */
+        private const val STEP_ARRIVE_M = 12.0
         /**
          * 예고 임계값 (m).
          * 각 값 이하로 진입 시 해당 단계 안내를 한 번 발화.
          * 내림차순 정렬 필수 → 멀리서부터 순서대로 announce.
          */
-        private val PROX_THRESHOLDS = listOf(150, 60)
+        private val PROX_THRESHOLDS = listOf(150, 60, 25)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -144,7 +145,7 @@ class NavigationGuide(private val tts: TextToSpeech) {
         val step = steps.getOrNull(idx) ?: return
         if (step.description.isBlank()) return
         Log.d(TAG, "안내[$idx] ${step.description}")
-        tts.speak(step.description, TextToSpeech.QUEUE_ADD, null, "nav-$idx")
+        tts.speak(step.description, TextToSpeech.QUEUE_FLUSH, null, "nav-$idx")
     }
 
     /** Haversine 거리 (m) */

@@ -2,4 +2,26 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- ── SafeStep 테마 색상 (라이트) ── -->
+    <color name="ss_bg">#F5F5F5</color>
+    <color name="ss_surface">#FFFFFF</color>
+    <color name="ss_surface2">#F5F5F5</color>
+    <color name="ss_text_primary">#1A1A1A</color>
+    <color name="ss_text_secondary">#888888</color>
+    <color name="ss_text_hint">#AAAAAA</color>
+    <color name="ss_text_hint2">#BBBBBB</color>
+    <color name="ss_text_field">#333333</color>
+    <color name="ss_text_grey">#666666</color>
+    <color name="ss_divider">#F0F0F0</color>
+    <color name="ss_divider2">#F5F5F5</color>
+    <color name="ss_toggle_bg">#F5F5F5</color>
+    <color name="ss_toggle_text">#AAAAAA</color>
+    <color name="ss_orange">#FF6B00</color>
+    <color name="ss_orange_light">#FFF5EE</color>
+    <color name="ss_orange_card">#FFF8F3</color>
+    <color name="ss_orange_tint">#FFF0E6</color>
+    <color name="ss_header_bg">#FFFFFF</color>
+    <color name="ss_card_border">#E0E0E0</color>
+    <color name="ss_section_label">#FF6B00</color>
 </resources>

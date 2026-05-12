@@ -14,6 +14,11 @@ import java.util.concurrent.TimeUnit
  */
 class AssistantClient(private val baseUrl: String) {
 
+    /** API 키 미설정(503) */
+    class ApiKeyException(msg: String) : Exception(msg)
+    /** 그 외 서버 오류 */
+    class ServerException(val code: Int, msg: String) : Exception(msg)
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -37,7 +42,10 @@ class AssistantClient(private val baseUrl: String) {
         http.newCall(request).execute().use { response ->
             val raw = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                throw RuntimeException("Assistant HTTP ${response.code}: $raw")
+                when (response.code) {
+                    503 -> throw ApiKeyException("GOOGLE_API_KEY 미설정: $raw")
+                    else -> throw ServerException(response.code, "HTTP ${response.code}: $raw")
+                }
             }
             val json = JSONObject(raw)
             val action = json.optString("action", "speak_only")

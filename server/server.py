@@ -324,21 +324,19 @@ def _detect_light_color(img_bgr: np.ndarray,
     h_img, w_img = img_bgr.shape[:2]
     x1 = max(0, x1);  y1 = max(0, y1)
     x2 = min(w_img, x2)
-    # 상단 80% 사용 (한국 신호등은 등이 크고 박스 위쪽에 있음)
-    y2_crop = min(h_img, y1 + int((y2 - y1) * 0.80))
+    # 상단 60% 만 사용
+    y2_crop = min(h_img, y1 + int((y2 - y1) * 0.60))
     crop = img_bgr[y1:y2_crop, x1:x2]
     if crop.size == 0:
         return None
 
-    hsv    = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    min_px = max(crop.shape[0] * crop.shape[1] * 0.02, 15)  # 2% or 15px (더 민감하게)
+    hsv      = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    min_px   = max(crop.shape[0] * crop.shape[1] * 0.03, 30)  # 3% or 30px
 
-    # 빨강: 낮은 채도/명도 임계값으로 더 잘 잡히게
-    red1     = cv2.inRange(hsv, (0,   40, 100), (12,  255, 255))
-    red2     = cv2.inRange(hsv, (158, 40, 100), (180, 255, 255))
+    red1     = cv2.inRange(hsv, (0,   50, 150), (10,  255, 255))
+    red2     = cv2.inRange(hsv, (160, 50, 150), (180, 255, 255))
     red_mask = cv2.bitwise_or(red1, red2)
-    # 초록: 범위 넓힘 (한국 보행 신호등 초록은 약간 청록빛)
-    grn_mask = cv2.inRange(hsv, (35,  40, 100), (110, 255, 255))
+    grn_mask = cv2.inRange(hsv, (40,  50, 150), (100, 255, 255))
 
     red_px = float(np.sum(red_mask)) / 255
     grn_px = float(np.sum(grn_mask)) / 255
@@ -444,9 +442,7 @@ async def detect_fast(file: UploadFile = File(...)):
         raise HTTPException(400, f"이미지 파싱 실패: {e}")
 
     w, h = image.size
-    t_infer = time.perf_counter()
     results = yolo_model(image, imgsz=160, verbose=False, half=_half)
-    fast_proc_ms = round((time.perf_counter() - t_infer) * 1000)
 
     _FAST_GROUPS = {"vehicle", "micro", "person"}
     detections = []
@@ -472,7 +468,7 @@ async def detect_fast(file: UploadFile = File(...)):
                 "approach_speed": None,
             })
     detections.sort(key=lambda d: d["area"], reverse=True)
-    return JSONResponse({"detections": detections, "proc_ms": fast_proc_ms})
+    return JSONResponse({"detections": detections})
 
 
 @app.post("/detect")
@@ -491,9 +487,7 @@ async def detect(file: UploadFile = File(...)):
         raise HTTPException(400, f"이미지 파싱 실패: {e}")
 
     w, h    = image.size
-    t_infer = time.perf_counter()
     results = yolo_model(image, imgsz=288, verbose=False, half=_half)
-    detect_proc_ms = round((time.perf_counter() - t_infer) * 1000)
     detections = []
     for result in results:
         for box in result.boxes:
@@ -571,7 +565,7 @@ async def detect(file: UploadFile = File(...)):
         else:
             det["approach_speed"] = None
 
-    return JSONResponse({"detections": detections, "proc_ms": detect_proc_ms})
+    return JSONResponse({"detections": detections})
 
 
 
@@ -597,9 +591,7 @@ async def segment(file: UploadFile = File(...)):
 
     w, h = image.size
 
-    t_infer = time.perf_counter()
     results = surface_model(image, imgsz=512, verbose=False, half=_half)
-    seg_proc_ms = round((time.perf_counter() - t_infer) * 1000)
 
     # ── 클래스별 픽셀 마스크 합산 ─────────────────────────────────────────
     combined = np.zeros((h, w), dtype=np.uint8)   # 카테고리 int
@@ -661,116 +653,9 @@ async def segment(file: UploadFile = File(...)):
         "mask_b64":  mask_b64,
         "ratios":    {cat: round(counts.get(cat, 0) / max(total_px, 1), 4) for cat in CAT_INT},
         "zones":     zones,
-        "proc_ms":   seg_proc_ms,
     }
     _cache_set(_segment_cache, md5, payload)
     return JSONResponse(payload)
-
-
-def _scan_for_light_blob(img_bgr: np.ndarray, top_ratio: float = 0.85) -> tuple[str | None, float]:
-    """
-    YOLO 탐지 없이 이미지 상단에서 밝은 빨강/초록 픽셀 덩어리를 직접 검색.
-    클라이언트가 이미 상단 40%를 크롭해서 보내므로 수신 이미지 대부분을 스캔.
-    반환: (color, confidence) — confidence는 픽셀 비율 기반 추정값.
-    """
-    h, w = img_bgr.shape[:2]
-    roi  = img_bgr[:int(h * top_ratio), :]
-
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-    # ── 빨강 LED: 채도 60+, 명도 120+ ────────────────────────────────────
-    red1 = cv2.inRange(hsv, (0,   60, 120), (15,  255, 255))
-    red2 = cv2.inRange(hsv, (155, 60, 120), (180, 255, 255))
-    red_mask = cv2.bitwise_or(red1, red2)
-
-    # ── 초록 LED: 채도 150+, 명도 150+
-    #    나무: S≈80~120, V≈80~150 → 이 조건에서 대부분 탈락
-    #    신호등 LED: S≈180~255, V≈180~255 → 통과
-    grn_mask = cv2.inRange(hsv, (40, 150, 150), (100, 255, 255))
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k)
-    grn_mask = cv2.morphologyEx(grn_mask, cv2.MORPH_OPEN, k)
-
-    total = roi.shape[0] * roi.shape[1]
-    # 신호등 LED 크기: 이미지의 0.005%~1% (너무 크면 차량/간판 등)
-    min_area = max(total * 0.00005, 10)
-    max_area = total * 0.01   # 1% 초과는 신호등 아닌 다른 물체
-
-    def _compact_blob_area(mask: np.ndarray) -> float:
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = 0.0
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area < min_area or area > max_area:
-                continue
-            best = max(best, area)
-        return best
-
-    red_area = _compact_blob_area(red_mask)
-    grn_area = _compact_blob_area(grn_mask)
-
-    if red_area < min_area and grn_area < min_area:
-        return None, 0.0
-
-    if red_area >= grn_area and red_area >= min_area:
-        conf = min(0.80, 0.45 + red_area / total * 1000)
-        return "red", round(conf, 3)
-    if grn_area >= min_area:
-        conf = min(0.80, 0.45 + grn_area / total * 1000)
-        return "green", round(conf, 3)
-
-    return None, 0.0
-
-
-@app.post("/signal")
-async def signal(file: UploadFile = File(...)):
-    """
-    신호등 색상 감지.
-    1차: yolov8n COCO traffic_light 탐지 + HSV 색상 분석
-    2차(폴백): 이미지 상단 직접 HSV 블롭 스캔 — YOLO 실패 시에도 동작
-    반환: { color: "red"|"green"|"blinking"|null, confidence: 0~1|null }
-    """
-    try:
-        raw   = await file.read()
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(400, f"이미지 파싱 실패: {e}")
-
-    img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-
-    best_color: str | None = None
-    best_conf              = 0.0
-
-    # ── 1차: YOLO 탐지 ─────────────────────────────────────────────────────
-    if signal_model is not None:
-        results = signal_model(image, imgsz=640, classes=[_TRAFFIC_LIGHT_CLASS],
-                               verbose=False, half=_half)
-        for result in results:
-            for box in result.boxes:
-                conf = float(box.conf[0])
-                if conf < 0.15:
-                    continue
-                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                color = _detect_light_color(img_bgr, x1, y1, x2, y2)
-                if color is not None and conf > best_conf:
-                    best_color = color
-                    best_conf  = conf
-
-    # ── 2차: 블롭 스캔 폴백 (YOLO가 신호등을 못 잡았을 때) ──────────────────
-    if best_color is None:
-        blob_color, blob_conf = _scan_for_light_blob(img_bgr, top_ratio=0.55)
-        if blob_color is not None:
-            best_color = blob_color
-            best_conf  = blob_conf * 0.75   # YOLO 탐지보다 신뢰도 낮게 설정
-
-    _light_history.append(best_color)
-    final_color = _traffic_light_status()
-
-    return JSONResponse({
-        "color":      final_color,
-        "confidence": round(best_conf, 3) if best_color is not None else None,
-    })
 
 
 if __name__ == "__main__":

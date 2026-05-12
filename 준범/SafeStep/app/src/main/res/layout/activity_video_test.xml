@@ -77,39 +77,6 @@
             android:layout_height="match_parent"
             android:background="@android:color/transparent" />
 
-        <!-- 좌상단: 신호등 색 카드 -->
-        <LinearLayout
-            android:id="@+id/signalInfoCard"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="top|start"
-            android:layout_margin="10dp"
-            android:background="#CC000000"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:paddingStart="8dp"
-            android:paddingEnd="10dp"
-            android:paddingTop="6dp"
-            android:paddingBottom="6dp"
-            android:visibility="gone">
-            <TextView
-                android:id="@+id/signalDistText"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="🔴 빨간불"
-                android:textColor="#FFFFFF"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-            <TextView
-                android:id="@+id/signalSafeText"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:text="신뢰도 --%"
-                android:textColor="#CCFFFFFF"
-                android:textSize="11sp" />
-        </LinearLayout>
-
         <!-- 동영상 미선택 안내 (일러스트 스타일) -->
         <LinearLayout
             android:id="@+id/emptyView"

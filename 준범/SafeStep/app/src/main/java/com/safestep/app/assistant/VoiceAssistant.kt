@@ -48,6 +48,7 @@ class VoiceAssistant(
     serverBaseUrl: String,
     private val screen: String,
     private val onAction: (AssistantAction) -> Unit,
+    private val onBusy: ((Boolean) -> Unit)? = null,  // true=처리중, false=완료
 ) {
     private val client       = AssistantClient(serverBaseUrl)
     private val scope        = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -60,6 +61,7 @@ class VoiceAssistant(
 
     private var inFlight: Job? = null
     private var ttsReady = false
+    @Volatile private var isBusy = false  // 처리 중 또는 TTS 발화 중
 
     init {
         tts = TextToSpeech(activity) { status ->
@@ -130,11 +132,12 @@ class VoiceAssistant(
             )
             return
         }
-        if (inFlight?.isActive == true) {
-            Log.d(TAG, "이미 처리 중 — 무시")
+        if (isBusy) {
+            Log.d(TAG, "처리 중 또는 TTS 발화 중 — 무시")
             return
         }
         vibrate(100)
+        onBusy?.invoke(true)
         startListening()
     }
 
@@ -171,6 +174,8 @@ class VoiceAssistant(
         override fun onError(error: Int) {
             Log.w(TAG, "음성 인식 에러: $error")
             speak("다시 말씀해주세요.")
+            isBusy = false
+            onBusy?.invoke(false)
         }
         override fun onBeginningOfSpeech() {}
         override fun onEndOfSpeech()       { vibrate(50) }
@@ -181,7 +186,7 @@ class VoiceAssistant(
     }
 
     private fun askServer(text: String) {
-        // 매 요청에 screen 컨텍스트를 자동 포함 — 서버가 화면별 도구 세트를 사용
+        isBusy = true
         val ctx = context + mapOf("screen" to screen)
         inFlight = scope.launch {
             val action = try {
@@ -189,19 +194,26 @@ class VoiceAssistant(
             } catch (e: AssistantClient.ApiKeyException) {
                 Log.e(TAG, "API 키 미설정", e)
                 speak("서버에 API 키가 설정되지 않았습니다. 서버 관리자에게 문의하세요.")
+                isBusy = false
                 return@launch
             } catch (e: AssistantClient.ServerException) {
                 Log.e(TAG, "서버 오류: ${e.code}", e)
                 speak("서버 오류가 발생했습니다. 잠시 후 다시 시도하세요.")
+                isBusy = false
                 return@launch
             } catch (e: Exception) {
-                Log.e(TAG, "서버 호출 실패", e)
+                Log.e(TAG, "서버 호출 실패: ${e.javaClass.simpleName} — ${e.message}", e)
                 speak("서버에 연결할 수 없습니다. URL 설정을 확인해주세요.")
+                isBusy = false
                 return@launch
             }
-            // tts 발화 + 앱 핸들러 호출 (둘 다 UI 스레드)
             if (action.tts.isNotBlank()) speak(action.tts)
             onAction(action)
+            // TTS 발화 예상 시간(2초) 후 잠금 해제
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                isBusy = false
+                onBusy?.invoke(false)
+            }, 2000L)
         }
     }
 

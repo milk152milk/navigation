@@ -3,19 +3,25 @@ package com.safestep.app
 import android.content.Intent
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.view.View
 import android.widget.EditText
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.safestep.app.assistant.AssistantAction
 import com.safestep.app.assistant.VoiceAssistant
 import com.safestep.app.detect.RemoteDetector
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 class SplashActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private lateinit var tts: TextToSpeech
     private lateinit var serverUrlInput: EditText
     private lateinit var voiceAssistant: VoiceAssistant
+    private lateinit var connectionDot: View
+    private lateinit var connectionStatusText: TextView
 
     companion object {
         const val PREFS_NAME = "safestep_prefs"
@@ -49,11 +55,18 @@ class SplashActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
 
+        // 연결 상태 뷰
+        connectionDot        = findViewById(R.id.connectionDot)
+        connectionStatusText = findViewById(R.id.connectionStatusText)
+
         // 서버 URL 입력창 — 저장된 값 불러오기
         serverUrlInput = findViewById(R.id.serverUrlInput)
         val savedUrl = prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
         serverUrlInput.setText(savedUrl)
         RemoteDetector.SERVER_URL = savedUrl
+
+        // 서버 연결 상태 확인
+        checkServerConnection(savedUrl)
 
         // 카메라 모드 카드
         findViewById<android.view.View>(R.id.startButton).setOnClickListener {
@@ -131,6 +144,37 @@ class SplashActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun checkServerConnection(url: String) {
+        val healthUrl = url.trimEnd('/').removeSuffix("/detect") + "/health"
+        Thread {
+            val ok = try {
+                val client = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(3, TimeUnit.SECONDS)
+                    .readTimeout(3, TimeUnit.SECONDS)
+                    .build()
+                val resp = client.newCall(
+                    okhttp3.Request.Builder().url(healthUrl).get().build()
+                ).execute()
+                resp.isSuccessful.also { resp.close() }
+            } catch (e: Exception) { false }
+
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                if (ok) {
+                    connectionDot.backgroundTintList =
+                        android.content.res.ColorStateList.valueOf(0xFF22C55E.toInt())
+                    connectionStatusText.text = "연결됨"
+                    connectionStatusText.setTextColor(0xFF22C55E.toInt())
+                } else {
+                    connectionDot.backgroundTintList =
+                        android.content.res.ColorStateList.valueOf(0xFFEF4444.toInt())
+                    connectionStatusText.text = "연결 안됨"
+                    connectionStatusText.setTextColor(0xFFEF4444.toInt())
+                }
+            }
+        }.start()
+    }
+
     private fun saveServerUrl() {
         val url = serverUrlInput.text.toString().trim().trimEnd('/')
         if (url.isNotEmpty()) {
@@ -139,6 +183,7 @@ class SplashActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 .putString(KEY_SERVER_URL, url)
                 .apply()
             RemoteDetector.SERVER_URL = url
+            checkServerConnection(url)
         }
     }
 

@@ -1,10 +1,7 @@
-# SafeStep 음성 어시스턴트 — /assistant 엔드포인트 (LangChain + Gemini)
-#
-# langchain-kr 튜토리얼 패턴을 따라 LangChain 으로 구현했습니다.
-# 참조: https://github.com/teddylee777/langchain-kr
+# SafeStep 음성 어시스턴트 — /assistant 엔드포인트 (google-generativeai)
 #
 # 핵심 흐름:
-#   사용자 음성 텍스트 + 화면 컨텍스트 → Gemini bind_tools → action JSON
+#   사용자 음성 텍스트 + 화면 컨텍스트 → Gemini → action JSON
 #
 # 화면별 동작:
 #   - SplashActivity (모드 선택 화면): 카메라 모드 / 동영상 테스트 진입만
@@ -12,162 +9,93 @@
 #
 # 통합 방법:
 #   1. 이 파일을 SafeStep/server/ 폴더에 복사
-#   2. server.py 에 라우터 등록 (INTEGRATION.md 참고)
+#   2. server.py 에 라우터 등록
 #   3. .env 에 GOOGLE_API_KEY 추가
-#   4. pip install langchain langchain-google-genai python-dotenv
+#   4. pip install google-generativeai python-dotenv
 
+import asyncio
+import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import requests as _requests
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel
 
+_executor = ThreadPoolExecutor(max_workers=2)
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# API KEY 정보로드 (langchain-kr 표준 패턴)
+# API KEY 로드
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 load_dotenv()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 모델 설정 — Gemini 2.0 Flash (무료 티어 / 빠름)
+# 모델 설정 — Groq (OpenAI 호환 API, 무료)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MODEL_NAME  = "gemini-2.0-flash"
-TEMPERATURE = 0.0   # 분류 작업이므로 결정적 출력
+MODEL_NAME   = "llama-3.1-8b-instant"
+_API_KEY     = os.getenv("GROQ_API_KEY", "")
+_GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 
-llm = None
-if os.getenv("GOOGLE_API_KEY"):
-    try:
-        llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=TEMPERATURE)
-        print(f"[Assistant] LangChain Gemini({MODEL_NAME}) 로드 완료 ✅")
-    except Exception as e:
-        print(f"[Assistant] LLM 초기화 실패: {e}")
+if _API_KEY:
+    print(f"[Assistant] Groq ({MODEL_NAME}) 준비 완료 ✅")
 else:
-    print("[Assistant] ⚠️  GOOGLE_API_KEY 미설정 — /assistant 비활성화")
+    print("[Assistant] ⚠️  GROQ_API_KEY 미설정 — /assistant 비활성화")
+
+
+def _call_groq(system: str, user: str) -> str:
+    """Groq API 호출 (blocking)."""
+    headers = {
+        "Authorization": f"Bearer {_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 256,
+    }
+    resp = _requests.post(_GROQ_URL, headers=headers, json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Tool 정의 — @tool 데코레이터 (langchain-kr 표준 패턴)
+# 도구 목록 (프롬프트 텍스트로 LLM 에 전달)
+# 실제 실행은 안드로이드 앱(Kotlin)이 action 이름을 보고 처리합니다.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 주의: 아래 도구 함수들은 서버에서 직접 실행되지 않습니다.
-# LangChain 은 함수 시그니처와 docstring 을 LLM 에 전달해서
-# "어떤 도구를 호출할지" 분류만 시킵니다.
-# 실제 동작은 안드로이드 앱(Kotlin)이 action 이름을 보고 실행합니다.
 
-# ─────────────────────────────────────────────
-# SplashActivity (모드 선택 화면) 전용 도구
-# ─────────────────────────────────────────────
-
-@tool
-def enter_camera_mode() -> str:
-    """SafeStep의 메인 화면(카메라 모드)으로 진입할 때 호출하세요.
-    예: "카메라 모드", "시작", "카메라로 들어가", "보행 모드", "출발"
-    """
-    return "카메라 모드를 시작합니다."
-
-
-@tool
-def enter_video_test_mode() -> str:
-    """동영상 테스트 모드로 진입할 때 호출하세요.
-    예: "동영상 테스트", "비디오 테스트", "테스트 모드"
-    """
-    return "동영상 테스트 모드를 시작합니다."
-
-
-# ─────────────────────────────────────────────
-# MapActivity (지도/카메라 화면) 전용 도구
-# ─────────────────────────────────────────────
-
-@tool
-def start_navigation(destination: str) -> str:
-    """사용자가 특정 목적지로 도보 내비게이션을 시작하고 싶을 때 호출하세요.
-
-    예: "강남역 가줘", "스타벅스로 안내해줘", "집까지 길 알려줘"
-
-    Args:
-        destination: 목적지 이름 (예: 강남역, 스타벅스, 우리집)
-    """
-    return f"{destination}으로 안내를 시작합니다."
-
-
-@tool
-def cancel_navigation() -> str:
-    """현재 진행 중인 내비게이션을 취소하거나 종료할 때 호출하세요.
-    예: "내비 그만", "안내 종료", "취소해"
-    """
-    return "내비게이션을 종료합니다."
-
-
-@tool
-def reroute() -> str:
-    """현재 목적지로 가는 경로를 다시 탐색하고 싶을 때 호출하세요.
-    예: "다시 길 찾아줘", "재탐색", "경로 새로 찾아줘"
-    """
-    return "경로를 다시 탐색합니다."
-
-
-@tool
-def get_current_location() -> str:
-    """사용자가 현재 자기 위치(주소·좌표)를 알고 싶어할 때 호출하세요.
-    예: "지금 어디야?", "현재 위치 알려줘", "내 위치 어디?"
-    """
-    return "현재 위치를 안내합니다."
-
-
-@tool
-def get_remaining_info() -> str:
-    """내비게이션 중 남은 거리 또는 도착 예정 시간을 알려달라고 할 때 호출하세요.
-    내비게이션 중이 아닐 때는 호출하지 마세요.
-    예: "얼마나 남았어?", "몇 분 걸려?", "남은 거리?"
-    """
-    return "남은 거리를 안내합니다."
-
-
-@tool
-def describe_surroundings() -> str:
-    """사용자가 카메라에 보이는 주변 상황(객체·장애물)을 설명해달라고 할 때 호출하세요.
-    예: "주변에 뭐 있어?", "앞에 뭐가 있어?", "주위 알려줘"
-    """
-    return "주변 상황을 안내합니다."
-
-
-@tool
-def find_nearby_poi(category: str) -> str:
-    """주변의 특정 종류 시설(화장실·편의점·약국 등)을 Tmap POI 검색으로 찾을 때 호출하세요.
-    "describe_surroundings"는 카메라에 보이는 객체 설명이고,
-    이 도구는 지도상의 시설 검색입니다. 헷갈리지 마세요.
-
-    예: "근처 화장실 찾아줘", "편의점 어디 있어?", "약국 알려줘"
-
-    Args:
-        category: 검색할 시설 종류 (예: 화장실, 편의점, 약국, 카페, 지하철역)
-    """
-    return f"주변 {category}을(를) 검색합니다."
-
-
-# ─────────────────────────────────────────────
-# 화면별 도구 세트
-# ─────────────────────────────────────────────
-SPLASH_TOOLS = [enter_camera_mode, enter_video_test_mode]
-MAP_TOOLS = [
-    start_navigation,
-    cancel_navigation,
-    reroute,
-    get_current_location,
-    get_remaining_info,
-    describe_surroundings,
-    find_nearby_poi,
-]
-
-
-def _tools_for_screen(screen: str):
-    """현재 화면에 맞는 도구 리스트 반환."""
+def _tool_list_for(screen: str) -> str:
+    """화면별 도구 목록을 프롬프트 텍스트로 반환."""
     if screen == "splash":
-        return SPLASH_TOOLS
-    return MAP_TOOLS   # 기본값: MapActivity
+        return """[사용 가능한 명령]
+- enter_camera_mode : 카메라 모드로 진입  (예: "카메라 모드", "시작", "출발", "보행 모드")
+- enter_video_test_mode : 동영상 테스트 모드로 진입  (예: "동영상 테스트", "테스트 모드")
+
+반드시 아래 JSON 형식 중 하나로만 답하세요 (다른 텍스트 없이 JSON 만):
+명령이 해당될 때: {"action": "명령이름", "params": {}, "tts": "사용자에게 읽어줄 짧은 문장"}
+해당 없을 때:    {"action": "speak_only", "params": {}, "tts": "응답 문장"}"""
+    return """[사용 가능한 명령]
+- start_navigation   : 목적지 내비게이션/경로 안내 시작  params: {"destination": "목적지명"}
+  ★ "~로 안내해줘", "~가줘", "~까지 길 알려줘", "~로 데려다줘" → 반드시 이 명령 사용
+  ★ destination에는 장소명만 넣으세요 (예: "강남역", "스타벅스", "상우고등학교")
+  ★ "학교", "병원" 같은 시설 카테고리가 아니라 구체적 장소명이 있으면 이 명령 사용
+- cancel_navigation  : 내비게이션 취소  예: "내비 그만", "안내 종료"
+- reroute            : 경로 재탐색  예: "다시 길 찾아줘", "재탐색"
+- get_current_location : 현재 위치 안내  예: "지금 어디야?", "내 위치 알려줘"
+- get_remaining_info : 남은 거리/시간 안내 (내비 중일 때만)  예: "얼마나 남았어?"
+- describe_surroundings : 주변 상황 설명  예: "주변에 뭐 있어?"
+- find_nearby_poi    : 주변 시설 종류 검색 (구체적 장소명 없을 때만)  params: {"category": "시설종류"}
+  예: "근처 화장실 찾아줘", "편의점 어디 있어?"
+
+반드시 아래 JSON 형식 중 하나로만 답하세요 (다른 텍스트 없이 JSON 만):
+명령이 해당될 때: {"action": "명령이름", "params": {}, "tts": "사용자에게 읽어줄 짧은 문장"}
+해당 없을 때:    {"action": "speak_only", "params": {}, "tts": "응답 문장"}"""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -226,78 +154,99 @@ router = APIRouter(tags=["assistant"])
 
 @router.post("/assistant")
 async def assistant(req: AssistantRequest):
-    """음성 텍스트 → LangChain Gemini → action JSON 반환."""
-    if llm is None:
+    """음성 텍스트 → Gemini → action JSON 반환."""
+    print(f"[Assistant] 요청 수신: '{req.text[:60]}'")
+
+    if not _API_KEY:
         raise HTTPException(503, "LLM 이 초기화되지 않았습니다. GOOGLE_API_KEY 를 확인하세요.")
     if not req.text.strip():
         raise HTTPException(400, "text 가 비어있습니다.")
 
-    screen = str(req.context.get("screen", "map"))
-    tools  = _tools_for_screen(screen)
-
-    # 화면에 맞는 시스템 프롬프트 + 도구를 LLM 에 결합
-    llm_with_tools = llm.bind_tools(tools)
-
+    screen    = str(req.context.get("screen", "map"))
     user_text = _build_user_message(req.text, req.context)
-    messages = [
-        SystemMessage(content=_system_prompt_for(screen)),
-        HumanMessage(content=user_text),
-    ]
+    system    = _system_prompt_for(screen) + "\n\n" + _tool_list_for(screen)
 
     try:
-        response = llm_with_tools.invoke(messages)
+        loop = asyncio.get_event_loop()
+        raw = await asyncio.wait_for(
+            loop.run_in_executor(_executor, _call_groq, system, user_text),
+            timeout=25.0
+        )
+        print(f"[Assistant] Groq 원본 응답:\n{raw}")
+    except asyncio.TimeoutError:
+        print(f"[Assistant] Groq 25초 타임아웃")
+        raise HTTPException(504, "LLM 응답 타임아웃")
     except Exception as e:
         print(f"[Assistant] LLM 호출 실패: {e}")
         raise HTTPException(502, f"LLM 호출 실패: {e}")
 
-    return JSONResponse(_parse_response(response))
+    parsed = _parse_raw_response(raw, req.text)
+    # start_navigation일 때 TMap 검색이 더 잘 되도록 원문을 destination으로 덮어씀
+    if parsed.get("action") == "start_navigation":
+        dest = parsed.get("params", {}).get("destination", "").strip()
+        if not dest:
+            parsed.setdefault("params", {})["destination"] = req.text
+        # 추출된 목적지가 너무 짧거나 카테고리명이면 원문 사용
+        if len(dest) < 2 or dest in ("학교", "병원", "역", "카페", "편의점", "약국"):
+            parsed["params"]["destination"] = req.text
+    print(f"[Assistant] 파싱 결과: {json.dumps(parsed, ensure_ascii=False)}")
+    return JSONResponse(parsed)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 응답 파싱
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _parse_response(response) -> dict[str, Any]:
-    """
-    LangChain AIMessage 응답 → 앱이 쓰기 좋은 형태로 변환.
-
-    response.tool_calls 예시:
-        [{"name": "start_navigation",
-          "args": {"destination": "강남역"},
-          "id": "...", "type": "tool_call"}]
-    """
-    tool_calls = getattr(response, "tool_calls", None) or []
-    text_content = (response.content or "").strip()
-
-    if tool_calls:
-        tc = tool_calls[0]
-        action = tc.get("name", "speak_only")
-        params = tc.get("args", {}) or {}
-        tts = text_content or _default_tts_for(action, params)
-        return {"action": action, "params": params, "tts": tts}
-
-    # 도구 호출 없음 → 일반 응답
-    return {
-        "action": "speak_only",
-        "params": {},
-        "tts": text_content or "죄송합니다. 다시 말씀해주세요.",
-    }
-
-
-def _default_tts_for(action: str, params: dict[str, Any]) -> str:
-    """LLM 이 tts 텍스트를 안 줬을 때의 기본 멘트."""
+def _default_tts(action: str, params: dict) -> str:
+    """action 이름으로 짧은 한국어 TTS 생성."""
     if action == "enter_camera_mode":
         return "카메라 모드를 시작합니다."
     if action == "enter_video_test_mode":
         return "동영상 테스트 모드를 시작합니다."
     if action == "start_navigation":
-        return f"{params.get('destination', '목적지')}으로 안내를 시작합니다."
+        dest = params.get("destination", "목적지")
+        return f"{dest}으로 안내를 시작합니다."
     if action == "cancel_navigation":
         return "내비게이션을 종료합니다."
     if action == "reroute":
         return "경로를 다시 탐색합니다."
+    if action == "get_current_location":
+        return "현재 위치를 확인합니다."
+    if action == "get_remaining_info":
+        return "남은 거리를 확인합니다."
+    if action == "describe_surroundings":
+        return "주변 상황을 확인합니다."
     if action == "find_nearby_poi":
-        return f"주변 {params.get('category', '시설')}을(를) 검색합니다."
-    return "네, 알겠습니다."
+        cat = params.get("category", "시설")
+        return f"주변 {cat}을 검색합니다."
+    return ""
+
+
+def _parse_raw_response(raw: str, original_text: str) -> dict[str, Any]:
+    """LLM 텍스트 응답 → 앱이 쓰기 좋은 action dict 로 변환."""
+    import re
+    # 코드 블록 제거 후 JSON 추출
+    cleaned = re.sub(r'```(?:json)?\s*', '', raw).strip().rstrip('`').strip()
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        try:
+            result = json.loads(match.group())
+            result.setdefault("action", "speak_only")
+            result.setdefault("params", {})
+            action = result["action"]
+            params = result.get("params", {})
+            # tts가 없거나 너무 길거나 JSON처럼 생겼으면 기본값 사용
+            tts = result.get("tts", "")
+            if not tts or len(tts) > 60 or "{" in tts:
+                tts = _default_tts(action, params)
+            result["tts"] = tts
+            return result
+        except Exception:
+            pass
+    # JSON 파싱 실패 → 텍스트를 그대로 TTS (단, 짧으면)
+    tts = raw.strip()
+    if len(tts) > 60 or "{" in tts:
+        tts = "죄송합니다. 다시 말씀해주세요."
+    return {"action": "speak_only", "params": {}, "tts": tts}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

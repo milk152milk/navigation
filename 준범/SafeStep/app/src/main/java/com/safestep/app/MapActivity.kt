@@ -47,7 +47,6 @@ import com.safestep.app.detect.Detection
 import com.safestep.app.detect.ObjectDetector
 import com.safestep.app.detect.RemoteDetector
 import com.safestep.app.detect.SegmentationClient
-import com.safestep.app.detect.SignalClient
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.safestep.app.navigation.NavigationGuide
 import com.safestep.app.navigation.PoiResult
@@ -82,10 +81,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var navStepCount: com.google.android.material.button.MaterialButton
     private lateinit var backToModeButton: Button
     private lateinit var statsOverlay: TextView
-    private lateinit var signalInfoCard: LinearLayout
-    private lateinit var signalDistText: TextView
-    private lateinit var signalSafeText: TextView
-
     // ── Core ──────────────────────────────────────────────────────────────────
     private lateinit var tts: TextToSpeech
     private lateinit var cameraExecutor: ExecutorService
@@ -103,7 +98,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
     private lateinit var detectExecutor: ExecutorService // 탐지 전용 스레드 (cameraExecutor 블로킹 방지)
     private lateinit var segExecutor: ExecutorService    // 세그멘테이션 전용 스레드
-    private lateinit var signalExecutor: ExecutorService // 신호등 전용 스레드
     private lateinit var fastExecutor: ExecutorService   // Fast Lane 전용 스레드
 
     /**
@@ -112,12 +106,10 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      */
     private val detectBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val segBusy    = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val signalBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val fastBusy   = java.util.concurrent.atomic.AtomicBoolean(false)  // Fast Lane 전용
     private var vibrator: Vibrator? = null
     private lateinit var detector: ObjectDetector
     private lateinit var segClient: SegmentationClient
-    private lateinit var signalClient: SignalClient
 
     // ── Location ──────────────────────────────────────────────────────────────
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -162,14 +154,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     // ── Segmentation ──────────────────────────────────────────────────────────
     @Volatile private var frameCount = 0
     @Volatile private var lastSurfaceStatus = ""
-
-    // ── Signal (신호등) ────────────────────────────────────────────────────────
-    @Volatile private var lastTrafficLightStatus: String? = "init"  // 최초 발화 방지
-    /** null 복귀 시 "건너셔도 됩니다" 오발화 방지용 — 마지막 실제 감지된 신호 색 */
-    @Volatile private var lastKnownSignalColor: String? = null
-    /** 횡단보도 밖에서 연속 동일 신호 감지 횟수 (오발화 방지용 연속 확인) */
-    @Volatile private var signalConsecCount = 0
-    @Volatile private var signalConsecColor: String? = null
 
     // ── Surface zones (3구역 회피 방향) ──────────────────────────────────────
     @Volatile private var lastZones: Map<String, String> = emptyMap()
@@ -263,10 +247,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         navStepCount    = findViewById(R.id.navStepCount)
         backToModeButton = findViewById(R.id.backToModeButton)
         statsOverlay     = findViewById(R.id.statsOverlay)
-        signalInfoCard   = findViewById(R.id.signalInfoCard)
-        signalDistText   = findViewById(R.id.signalDistText)
-        signalSafeText   = findViewById(R.id.signalSafeText)
-
         backToModeButton.setOnClickListener {
             startActivity(Intent(this, SplashActivity::class.java))
             finish()
@@ -281,7 +261,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         cameraExecutor = Executors.newSingleThreadExecutor()
         detectExecutor = Executors.newSingleThreadExecutor()
         segExecutor    = Executors.newSingleThreadExecutor()
-        signalExecutor = Executors.newSingleThreadExecutor()
         fastExecutor   = Executors.newSingleThreadExecutor()
         // SharedPreferences에서 설정값 불러와 적용
         val mapPrefs = getSharedPreferences(SplashActivity.PREFS_NAME, MODE_PRIVATE)
@@ -312,12 +291,12 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             serverBaseUrl = assistantBaseUrl,
             screen        = "map",
             onAction      = { action -> handleAssistantAction(action) },
+            onBusy        = { busy -> detectionTtsEnabled = !busy },
         )
         voiceAssistant.attachLongPressTo(findViewById(android.R.id.content))
 
         detector       = ObjectDetector.create(this)
         segClient      = SegmentationClient(RemoteDetector.SERVER_URL)
-        signalClient   = SignalClient(RemoteDetector.SERVER_URL)
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
         // 나침반 + 이동 감지 센서
@@ -447,7 +426,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         cameraExecutor.shutdown()
         detectExecutor.shutdown()
         segExecutor.shutdown()
-        signalExecutor.shutdown()
         fastExecutor.shutdown()
         tts.shutdown()
         speechRecognizer?.destroy()
@@ -713,7 +691,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun startListening() {
         isListening = true
         destMicButton.text = "⏹"
-        tts.speak("목적지를 말씀해주세요.", TextToSpeech.QUEUE_FLUSH, null, "dest-prompt")
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
@@ -793,15 +770,12 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         override fun onEvent(t: Int, p: Bundle?) {}
     }
 
-    private fun handleDestinationQuery(query: String) {
+    private fun handleDestinationQuery(query: String, skipConfirm: Boolean = false) {
         destinationText.text = "\"$query\" 검색 중…"
-        // 목적지 인식 시점부터 장애물 경고 TTS 활성화
         detectionTtsEnabled = true
         tts.speak("$query 검색합니다.", TextToSpeech.QUEUE_FLUSH, null, "searching")
 
         TmapService.searchPoi(query) { pois ->
-            // TmapService는 main.post로 콜백하므로 이미 메인 스레드
-            // → Activity 소멸 후 TTS/View 접근 방지
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
                 if (pois.isEmpty()) {
@@ -811,11 +785,21 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 val dest = pois.first()
                 destinationText.text = dest.name
-                // 목적지 확인 후 음성으로 재확인 요청
-                tts.speak("${dest.name}(으)로 안내할까요? 네 또는 아니오로 말씀해주세요.",
-                    TextToSpeech.QUEUE_FLUSH, null, "confirm-prompt")
-                pendingDest = dest
-                startConfirmListening()
+                if (skipConfirm) {
+                    // 음성 어시스턴트로 호출 시 — 확인 없이 바로 내비 시작
+                    val loc = currentLocation
+                    if (loc == null) {
+                        tts.speak("위치를 확인할 수 없습니다.", TextToSpeech.QUEUE_FLUSH, null, "no-loc")
+                        return@runOnUiThread
+                    }
+                    fetchRoute(loc.latitude, loc.longitude, dest)
+                } else {
+                    // 마이크 버튼으로 호출 시 — 기존 확인 플로우
+                    tts.speak("${dest.name}(으)로 안내할까요? 네 또는 아니오로 말씀해주세요.",
+                        TextToSpeech.QUEUE_FLUSH, null, "confirm-prompt")
+                    pendingDest = dest
+                    startConfirmListening()
+                }
             }
         }
     }
@@ -1002,19 +986,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
 
-            // ③ 신호등 — 5프레임마다 (차량 긴급 여부 무관 — 차량 있을 때가 더 중요)
-            if (frameCount % 5 == 0 && signalBusy.compareAndSet(false, true)) {
-                signalExecutor.execute {
-                    try {
-                        val signal = signalClient.detect(corrected, 0)
-                        handleTrafficLight(signal)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "신호등 감지 실패: ${e.message}")
-                    } finally {
-                        signalBusy.set(false)
-                    }
-                }
-            }
         } catch (e: Exception) {
             Log.e(TAG, "프레임 분석 실패", e)
         } finally {
@@ -1192,101 +1163,6 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             else            -> WarnLevel.NONE     to 0
         }
         ObjGroup.OTHER -> WarnLevel.NONE to 0
-    }
-
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 신호등 상태 처리 — 횡단보도 여부 + 연속 감지로 오발화 방지
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    private fun handleTrafficLight(result: com.safestep.app.detect.SignalResult?) {
-        val color = result?.color
-        val conf  = result?.confidence ?: 0f
-
-        // ── UI 카드 업데이트 (신호 감지 여부와 무관하게 항상) ────────────────
-        updateSignalCard(color, conf)
-
-        // ── 횡단보도 위: 즉시 안내 ────────────────────────────────────────────
-        if (onCrosswalk) {
-            if (color == lastTrafficLightStatus) return
-            lastTrafficLightStatus = color
-            signalConsecCount = 0
-            signalConsecColor = null
-            if (color != null) lastKnownSignalColor = color
-
-            val msg = when (color) {
-                "red"      -> "빨간불입니다. 멈추세요."
-                "green"    -> "초록불입니다. 건너세요."
-                "blinking" -> "초록불이 깜빡입니다. 서두르세요."
-                null -> {
-                    val vehicleRecent = SystemClock.elapsedRealtime() - lastVehicleDetectMs < 3_000L
-                    val wasRed        = lastKnownSignalColor == "red"
-                    if (vehicleRecent || wasRed) "신호등을 확인할 수 없습니다. 주변을 살펴보세요."
-                    else return
-                }
-                else -> return
-            }
-            tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "tl-${color ?: "none"}")
-            return
-        }
-
-        // ── 횡단보도 밖: 연속 2회 + 신뢰도 0.5 이상일 때 안내 ──────────────
-        if (color == null) {
-            signalConsecCount = 0
-            signalConsecColor = null
-            return
-        }
-
-        if (conf < 0.5f) {
-            if (color != signalConsecColor) { signalConsecCount = 0; signalConsecColor = color }
-            return
-        }
-
-        if (color == signalConsecColor) {
-            signalConsecCount++
-        } else {
-            signalConsecColor = color
-            signalConsecCount = 1
-        }
-
-        if (signalConsecCount < 2) return
-        if (color == lastTrafficLightStatus) return
-
-        lastTrafficLightStatus = color
-        lastKnownSignalColor   = color
-        signalConsecCount      = 0
-
-        val msg = when (color) {
-            "red"      -> "빨간불입니다. 멈추세요."
-            "green"    -> "초록불입니다. 건너도 됩니다."
-            "blinking" -> "초록불이 깜빡입니다. 서두르세요."
-            else       -> return
-        }
-        tts.speak(msg, TextToSpeech.QUEUE_ADD, null, "tl-$color")
-    }
-
-    /** 카메라 뷰 좌상단 신호등 색 카드 업데이트 */
-    private fun updateSignalCard(color: String?, conf: Float) {
-        runOnUiThread {
-            if (color == null) {
-                signalInfoCard.visibility = View.GONE
-                return@runOnUiThread
-            }
-            val (emoji, label, bgColor) = when (color) {
-                "red"      -> Triple("🔴", "빨간불", 0xCCCC2222.toInt())
-                "green"    -> Triple("🟢", "초록불", 0xCC227722.toInt())
-                "blinking" -> Triple("🟡", "점멸", 0xCCCC8800.toInt())
-                else       -> return@runOnUiThread
-            }
-            signalInfoCard.setBackgroundColor(bgColor)
-            signalDistText.text = "$emoji $label"
-            signalSafeText.text = "신뢰도 ${(conf * 100).toInt()}%"
-            signalInfoCard.visibility = View.VISIBLE
-
-            // 3초 후 자동 숨김
-            mainHandler.removeCallbacksAndMessages("signal-card")
-            mainHandler.postAtTime({
-                signalInfoCard.visibility = View.GONE
-            }, "signal-card", android.os.SystemClock.uptimeMillis() + 3_000L)
-        }
     }
 
     private fun handleSegmentation(seg: com.safestep.app.detect.SegmentResult) {
@@ -1671,7 +1547,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun handleAssistantAction(action: AssistantAction) {
         when (action) {
-            is AssistantAction.StartNavigation     -> handleDestinationQuery(action.destination)
+            is AssistantAction.StartNavigation     -> handleDestinationQuery(action.destination, skipConfirm = true)
             is AssistantAction.CancelNavigation    -> cancelNavigation()
             is AssistantAction.Reroute             -> rerouteCurrentDestination()
             is AssistantAction.CurrentLocation     -> speakCurrentLocation()

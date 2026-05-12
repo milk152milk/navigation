@@ -1,5 +1,6 @@
 package com.safestep.app.assistant
 
+import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,7 +22,7 @@ class AssistantClient(private val baseUrl: String) {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
     /**
@@ -34,8 +35,11 @@ class AssistantClient(private val baseUrl: String) {
             put("context", JSONObject(context))
         }.toString().toRequestBody(JSON_MEDIA)
 
+        val url = "$baseUrl/assistant"
+        Log.d("AssistantClient", "요청 URL: $url")
+
         val request = Request.Builder()
-            .url("$baseUrl/assistant")
+            .url(url)
             .post(body)
             .build()
 

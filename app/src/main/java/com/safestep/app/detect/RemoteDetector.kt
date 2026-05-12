@@ -3,6 +3,7 @@ package com.safestep.app.detect
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.os.SystemClock
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -85,15 +86,27 @@ class RemoteDetector : ObjectDetector {
                 .post(requestBody)
                 .build()
 
+            val t0       = SystemClock.elapsedRealtime()
             val response = client.newCall(request).execute()
+            val rttMs    = SystemClock.elapsedRealtime() - t0
+
             if (!response.isSuccessful) {
                 Log.w(TAG, "서버 응답 실패: ${response.code}")
                 return emptyList()
             }
 
             // 3) JSON 파싱 → List<Detection>
-            val body = response.body?.string() ?: return emptyList()
-            parseResponse(body)
+            val body    = response.body?.string() ?: return emptyList()
+            val results = parseResponse(body)
+
+            // proc_ms: 서버가 포함한 순수 추론 시간 (없으면 null)
+            val procMs = try {
+                org.json.JSONObject(body).optLong("proc_ms", -1L).takeIf { it >= 0 }
+            } catch (_: Exception) { null }
+            LatencyTracker.recordDetect(rttMs, procMs)
+            Log.d(TAG, "RTT ${rttMs}ms${procMs?.let { " / srv ${it}ms" } ?: ""}")
+
+            results
 
         } catch (e: Exception) {
             Log.w(TAG, "서버 통신 실패: ${e.message}")
@@ -166,11 +179,19 @@ class RemoteDetector : ObjectDetector {
                     jpegBytes.toRequestBody("image/jpeg".toMediaType()))
                 .build()
 
-            val request = Request.Builder().url(FAST_URL).post(requestBody).build()
+            val request  = Request.Builder().url(FAST_URL).post(requestBody).build()
+            val t0       = SystemClock.elapsedRealtime()
             val response = client.newCall(request).execute()
+            val rttMs    = SystemClock.elapsedRealtime() - t0
             if (!response.isSuccessful) return emptyList()
 
-            parseResponse(response.body?.string() ?: return emptyList())
+            val body    = response.body?.string() ?: return emptyList()
+            val results = parseResponse(body)
+            val procMs  = try {
+                org.json.JSONObject(body).optLong("proc_ms", -1L).takeIf { it >= 0 }
+            } catch (_: Exception) { null }
+            LatencyTracker.recordFast(rttMs, procMs)
+            results
         } catch (e: Exception) {
             Log.w(TAG, "고속 탐지 실패: ${e.message}")
             emptyList()

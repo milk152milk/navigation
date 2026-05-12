@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+
+    <!-- 왼쪽 발 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,55 C24,55 18,50 18,42 C18,34 24,28 30,30 C36,32 38,38 37,45 C36,52 36,55 30,55 Z" />
+    <!-- 왼발 엄지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M22,27 C19,24 19,19 22,17 C25,15 29,17 29,21 C29,25 25,28 22,27 Z" />
+    <!-- 왼발 검지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M29,24 C27,21 28,17 31,16 C34,15 36,18 35,22 C34,25 31,26 29,24 Z" />
+    <!-- 왼발 중지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M36,25 C34,22 35,18 38,17 C41,16 43,19 42,23 C41,26 38,27 36,25 Z" />
+    <!-- 왼발 약지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,28 C40,25 42,22 44,22 C47,22 48,25 47,28 C46,31 43,31 42,28 Z" />
+
+    <!-- 오른쪽 발 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M68,78 C62,78 56,73 57,65 C58,57 64,52 70,54 C76,56 77,62 76,69 C75,76 74,78 68,78 Z" />
+    <!-- 오른발 엄지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M76,51 C79,48 83,49 85,53 C87,57 84,61 80,60 C77,59 74,55 76,51 Z" />
+    <!-- 오른발 검지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M69,48 C71,45 75,45 77,48 C79,51 77,55 74,55 C71,55 68,52 69,48 Z" />
+    <!-- 오른발 중지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M62,49 C63,46 67,46 69,49 C71,52 69,56 66,56 C63,56 61,52 62,49 Z" />
+    <!-- 오른발 약지 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M56,53 C57,50 60,50 62,53 C63,56 62,59 59,59 C57,59 55,56 56,53 Z" />
+
+</vector>

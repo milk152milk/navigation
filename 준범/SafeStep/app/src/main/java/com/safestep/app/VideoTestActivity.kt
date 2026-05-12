@@ -14,6 +14,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.VideoView
 import com.safestep.app.detect.RemoteDetector
@@ -36,6 +37,14 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var detectionStatus: TextView
     private lateinit var selectVideoButton: Button
     private lateinit var playPauseButton: Button
+    private lateinit var seekBar: SeekBar
+    private lateinit var currentTimeText: TextView
+    private lateinit var totalTimeText: TextView
+
+    // SeekBar 업데이트 루프
+    private val seekHandler = Handler(Looper.getMainLooper())
+    private var videoDurationMs = 0
+    private var isUserSeeking = false
 
     // ── Core ──────────────────────────────────────────────────────────────────
     private lateinit var tts: TextToSpeech
@@ -87,6 +96,9 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         detectionStatus  = findViewById(R.id.detectionStatus)
         selectVideoButton = findViewById(R.id.selectVideoButton)
         playPauseButton  = findViewById(R.id.playPauseButton)
+        seekBar          = findViewById(R.id.videoSeekBar)
+        currentTimeText  = findViewById(R.id.currentTimeText)
+        totalTimeText    = findViewById(R.id.totalTimeText)
 
         tts          = TextToSpeech(this, this)
         detector     = ObjectDetector.create(this)
@@ -106,6 +118,7 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         stopFrameDetection()
+        seekHandler.removeCallbacks(seekUpdateRunnable)
         retriever?.release()
         tts.shutdown()
         runCatching { detector.close() }
@@ -125,19 +138,36 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (videoView.isPlaying) pauseVideo() else playVideo()
         }
 
-        // 좌상단 뒤로가기 버튼 (카메라 모드와 동일한 위치)
+        // 좌상단 뒤로가기 버튼
         findViewById<android.view.View>(R.id.backToModeButton).setOnClickListener {
             startActivity(Intent(this, SplashActivity::class.java))
             finish()
         }
+
+        // SeekBar 드래그
+        seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onStartTrackingTouch(sb: SeekBar) {
+                isUserSeeking = true
+            }
+            override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
+                if (fromUser) currentTimeText.text = formatTime(progress)
+            }
+            override fun onStopTrackingTouch(sb: SeekBar) {
+                videoView.seekTo(sb.progress)
+                isUserSeeking = false
+            }
+        })
     }
 
     private fun setupVideoView() {
         videoView.setOnCompletionListener {
             stopFrameDetection()
+            seekHandler.removeCallbacks(seekUpdateRunnable)
             playPauseButton.text = "▶ 재생"
             detectionStatus.text = "동영상 재생 완료"
             bboxOverlay.clear()
+            seekBar.progress = videoDurationMs
+            currentTimeText.text = formatTime(videoDurationMs)
         }
     }
 
@@ -163,6 +193,10 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             emptyView.visibility = View.GONE
             playPauseButton.isEnabled = true
             detectionStatus.text = "재생 버튼을 눌러 탐지를 시작하세요"
+            videoDurationMs = mp.duration
+            seekBar.max = videoDurationMs
+            totalTimeText.text = formatTime(videoDurationMs)
+            currentTimeText.text = "0:00"
         }
         videoView.requestFocus()
     }
@@ -171,13 +205,34 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         videoView.start()
         playPauseButton.text = "⏸ 일시정지"
         startFrameDetection()
+        seekHandler.post(seekUpdateRunnable)
     }
 
     private fun pauseVideo() {
         if (videoView.isPlaying) videoView.pause()
         playPauseButton.text = "▶ 재생"
         stopFrameDetection()
+        seekHandler.removeCallbacks(seekUpdateRunnable)
         bboxOverlay.clear()
+    }
+
+    // SeekBar 위치를 100ms마다 갱신
+    private val seekUpdateRunnable = object : Runnable {
+        override fun run() {
+            if (videoView.isPlaying && !isUserSeeking) {
+                val pos = videoView.currentPosition
+                seekBar.progress = pos
+                currentTimeText.text = formatTime(pos)
+            }
+            seekHandler.postDelayed(this, 100)
+        }
+    }
+
+    private fun formatTime(ms: Int): String {
+        val totalSec = ms / 1000
+        val min = totalSec / 60
+        val sec = totalSec % 60
+        return "%d:%02d".format(min, sec)
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -277,49 +332,4 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         segmentOverlay.setImageBitmap(seg.maskBitmap)
 
         val status = seg.status
-        if (status == lastSurfaceStatus) return   // 상태 변화 없으면 무시
-        lastSurfaceStatus = status
-
-        when (status) {
-            "road"    -> tts.speak("차도입니다. 주의하세요.",     TextToSpeech.QUEUE_ADD, null, "road-warn")
-            "caution" -> tts.speak("위험 구역입니다. 주의하세요.", TextToSpeech.QUEUE_ADD, null, "caution-warn")
-            "alley"   -> tts.speak("골목길입니다. 주의하세요.",   TextToSpeech.QUEUE_ADD, null, "alley-warn")
-        }
-    }
-
-    private fun showWarning(message: String, side: String) {
-        warningText.text = message
-        warningBanner.visibility = View.VISIBLE
-
-        val now = SystemClock.elapsedRealtime()
-        if (message != lastSpoken || now - lastSpeakMs >= SPEAK_COOLDOWN_MS) {
-            lastSpoken  = message
-            lastSpeakMs = now
-            tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "warn-$now")
-        }
-
-        val pattern = when (side) {
-            "왼쪽"  -> longArrayOf(0, 120, 80, 120, 80, 350)
-            "오른쪽" -> longArrayOf(0, 350, 80, 120, 80, 120)
-            else    -> longArrayOf(0, 250, 80, 100, 80, 250)
-        }
-        @Suppress("DEPRECATION")
-        vibrator?.vibrate(VibrationEffect.createWaveform(pattern, -1))
-
-        warningBanner.postDelayed({ warningBanner.visibility = View.GONE }, 3_000)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // TTS
-    // ══════════════════════════════════════════════════════════════════════════
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts.language = Locale.KOREAN
-            tts.speak(
-                "동영상 테스트 모드입니다. 동영상 선택 버튼을 눌러주세요.",
-                TextToSpeech.QUEUE_FLUSH, null, "video-intro"
-            )
-        }
-    }
-}
+     

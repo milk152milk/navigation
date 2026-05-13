@@ -21,11 +21,15 @@ import android.widget.VideoView
 import com.safestep.app.detect.RemoteDetector
 import com.safestep.app.detect.SegmentationClient
 import com.safestep.app.detect.SegmentResult
+import com.safestep.app.detect.SignalClient
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.safestep.app.detect.Detection
 import com.safestep.app.detect.ObjectDetector
 import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
@@ -50,12 +54,29 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     // ── Core ──────────────────────────────────────────────────────────────────
     private lateinit var tts: TextToSpeech
     private lateinit var detector: ObjectDetector
-    private lateinit var segClient: SegmentationClient
+    @Volatile private lateinit var segClient: SegmentationClient
+    @Volatile private lateinit var signalClient: SignalClient
     private lateinit var segmentOverlay: ImageView
     private var vibrator: Vibrator? = null
     @Volatile private var frameCount = 0
     @Volatile private var lastSurfaceStatus = ""
     @Volatile private var lastSurfaceSpeakMs = 0L
+
+    // 실시간 카메라(MapActivity)와 동일한 병렬 파이프라인 구조
+    private lateinit var fastExecutor: ExecutorService
+    private lateinit var detectExecutor: ExecutorService
+    private lateinit var segExecutor: ExecutorService
+    private lateinit var signalExecutor: ExecutorService
+
+    private val fastBusy   = AtomicBoolean(false)
+    private val detectBusy = AtomicBoolean(false)
+    private val segBusy    = AtomicBoolean(false)
+    private val signalBusy = AtomicBoolean(false)
+
+    // 신호등 (사용자 토글 + 횡단보도 컨텍스트)
+    @Volatile private var signalEnabled = false
+    @Volatile private var lastTrafficColor: String? = null
+    @Volatile private var lastTrafficSpeakMs = 0L
 
     // ── 프레임 추출 타이머 ─────────────────────────────────────────────────────
     private val frameHandler = Handler(Looper.getMainLooper())
@@ -103,10 +124,25 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         tts          = TextToSpeech(this, this)
         detector     = ObjectDetector.create(this)
-        segClient    = SegmentationClient(RemoteDetector.SERVER_URL)
+        val resolvedUrl = RemoteDetector.SERVER_URL.ifBlank { SplashActivity.DEFAULT_SERVER_URL }
+        segClient    = SegmentationClient(resolvedUrl)
+        signalClient = SignalClient(resolvedUrl)
         segmentOverlay  = findViewById(R.id.segmentOverlay)
         @Suppress("DEPRECATION")
         vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
+
+        // 병렬 파이프라인 — MapActivity와 동일 구조
+        fastExecutor   = Executors.newSingleThreadExecutor()
+        detectExecutor = Executors.newSingleThreadExecutor()
+        segExecutor    = Executors.newSingleThreadExecutor()
+        signalExecutor = Executors.newSingleThreadExecutor()
+
+        // 신호등 토글 (사용자 설정)
+        val prefs = getSharedPreferences(SplashActivity.PREFS_NAME, MODE_PRIVATE)
+        signalEnabled = prefs.getBoolean(
+            SettingsActivity.KEY_SIGNAL_ENABLED,
+            SettingsActivity.DEFAULT_SIGNAL_ENABLED
+        )
 
         setupButtons()
         setupVideoView()
@@ -117,12 +153,31 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         pauseVideo()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 설정 화면에서 돌아왔을 때 신호등 토글 새로고침
+        val prefs = getSharedPreferences(SplashActivity.PREFS_NAME, MODE_PRIVATE)
+        signalEnabled = prefs.getBoolean(
+            SettingsActivity.KEY_SIGNAL_ENABLED,
+            SettingsActivity.DEFAULT_SIGNAL_ENABLED
+        )
+    }
+
     override fun onDestroy() {
         stopFrameDetection()
         seekHandler.removeCallbacks(seekUpdateRunnable)
         retriever?.release()
         tts.shutdown()
         runCatching { detector.close() }
+        // 파이프라인 Executor 안전 종료 (MapActivity와 동일 패턴)
+        listOf(fastExecutor, detectExecutor, segExecutor, signalExecutor).forEach { ex ->
+            runCatching {
+                ex.shutdown()
+                if (!ex.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)) {
+                    ex.shutdownNow()
+                }
+            }
+        }
         super.onDestroy()
     }
 
@@ -242,7 +297,8 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private val frameRunnable = object : Runnable {
         override fun run() {
-            if (videoView.isPlaying && !isDetecting) {
+            // 매 FRAME_INTERVAL_MS 마다 추출 시도 → 파이프라인은 각자 skip-if-busy 처리
+            if (videoView.isPlaying) {
                 extractAndDetect(videoView.currentPosition)
             }
             frameHandler.postDelayed(this, FRAME_INTERVAL_MS)
@@ -261,33 +317,80 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun extractAndDetect(positionMs: Int) {
         val ret = retriever ?: return
-        isDetecting = true
 
+        // 프레임 추출 — 비교적 빠르므로 메인에서 동기로 시도, 실제 추출은 별도 스레드
         Thread {
-            try {
-                // 현재 재생 위치 프레임 추출 (마이크로초 단위)
-                val bitmap = ret.getFrameAtTime(
+            val bitmap = try {
+                ret.getFrameAtTime(
                     positionMs * 1000L,
                     MediaMetadataRetriever.OPTION_CLOSEST_SYNC
                 )
+            } catch (e: Exception) { null } ?: return@Thread
 
-                if (bitmap != null) {
-                    val detections = detector.detect(bitmap, 0)
+            frameCount++
 
-                    frameCount++
-                    // 세그멘테이션 (2프레임마다)
-                    val seg = if (frameCount % 2 == 0) segClient.segment(bitmap, 0) else null
-
-                    runOnUiThread {
-                        handleDetections(detections)
-                        if (seg != null) handleSegmentation(seg)
-                        isDetecting = false
+            // 🚀 ① Fast Lane — 매 프레임, 차량·사람 전용 (imgsz=160)
+            //    실시간 카메라(MapActivity)와 동일한 충돌 회피 경로
+            if (fastBusy.compareAndSet(false, true)) {
+                fastExecutor.execute {
+                    try {
+                        val fastDet = detector as? RemoteDetector
+                        if (fastDet != null) {
+                            val detections = fastDet.detectFast(bitmap, 0)
+                            if (detections.isNotEmpty()) {
+                                runOnUiThread { handleDetections(detections) }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w("VideoTestActivity", "Fast Lane 실패: ${e.message}")
+                    } finally {
+                        fastBusy.set(false)
                     }
-                } else {
-                    runOnUiThread { isDetecting = false }
                 }
-            } catch (e: Exception) {
-                runOnUiThread { isDetecting = false }
+            }
+
+            // ② 일반 탐지 — 매 프레임, 모든 객체 + depth (Fast Lane 보완)
+            if (detectBusy.compareAndSet(false, true)) {
+                detectExecutor.execute {
+                    try {
+                        val detections = detector.detect(bitmap, 0)
+                        runOnUiThread { handleDetections(detections) }
+                    } catch (e: Exception) {
+                        Log.w("VideoTestActivity", "탐지 실패: ${e.message}")
+                    } finally {
+                        detectBusy.set(false)
+                    }
+                }
+            }
+
+            // ③ 노면 세그멘테이션 — 2프레임마다
+            if (frameCount % 2 == 0 && segBusy.compareAndSet(false, true)) {
+                segExecutor.execute {
+                    try {
+                        val seg = segClient.segment(bitmap, 0)
+                        if (seg != null) runOnUiThread { handleSegmentation(seg) }
+                    } catch (e: Exception) {
+                        Log.w("VideoTestActivity", "세그멘테이션 실패: ${e.message}")
+                    } finally {
+                        segBusy.set(false)
+                    }
+                }
+            }
+
+            // ④ 신호등 — 3프레임마다, 토글 ON + 횡단보도/차도 컨텍스트
+            if (signalEnabled && frameCount % 3 == 0 &&
+                (lastSurfaceStatus == "crosswalk" || lastSurfaceStatus == "road") &&
+                signalBusy.compareAndSet(false, true)) {
+                signalExecutor.execute {
+                    try {
+                        val signal = signalClient.detect(bitmap, 0)
+                        if (signal != null) runOnUiThread { handleTrafficLight(signal.color) }
+                    } catch (e: Exception) {
+                        Log.w("VideoTestActivity", "신호등 감지 실패: ${e.message}")
+                    } finally {
+                        signalBusy.set(false)
+                    }
+                }
             }
         }.start()
     }
@@ -348,6 +451,32 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "alley"     -> "골목길입니다. 주의하세요."
             "caution"   -> if (seg.isStairs) "계단이 있습니다. 조심하세요." else "위험 구역입니다."
             else        -> return  // sidewalk, unknown 등은 안내 안 함
+        }
+        speak(message)
+    }
+
+    /**
+     * 신호등 색상 결과 처리 — 횡단보도/차도 컨텍스트에서만 호출됨.
+     * MapActivity.handleTrafficLight 와 동일한 로직.
+     */
+    private fun handleTrafficLight(color: String?) {
+        if (color == null) return
+        if (!signalEnabled) return
+        if (lastSurfaceStatus != "crosswalk" && lastSurfaceStatus != "road") return
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val sameColor = (color == lastTrafficColor)
+        val cooldownMs = 5_000L
+        if (sameColor && nowMs - lastTrafficSpeakMs < cooldownMs) return
+
+        lastTrafficColor = color
+        lastTrafficSpeakMs = nowMs
+
+        val message = when (color) {
+            "red"      -> "빨간불입니다. 멈추세요."
+            "green"    -> "초록불입니다. 건너세요."
+            "blinking" -> "신호가 깜빡입니다. 다음 신호를 기다리세요."
+            else       -> return
         }
         speak(message)
     }

@@ -3,6 +3,7 @@ package com.safestep.app
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import android.view.View
 import android.view.WindowManager
 import android.widget.EditText
 import android.widget.SeekBar
@@ -10,6 +11,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import java.util.concurrent.TimeUnit
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import com.google.android.material.bottomnavigation.BottomNavigationView
@@ -58,6 +60,8 @@ class SettingsActivity : AppCompatActivity() {
     // 서버
     private lateinit var serverUrlInput: EditText
     private lateinit var saveUrlButton: MaterialButton
+    private lateinit var settingsConnectionDot: View
+    private lateinit var settingsConnectionStatus: TextView
 
     companion object {
         const val KEY_TTS_SPEED        = "tts_speed"
@@ -117,6 +121,13 @@ class SettingsActivity : AppCompatActivity() {
         setupListeners()
         setupBottomNav()
         applyKeepScreen()
+        checkServerConnection()  // 서버 연결 상태 실시간 확인
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 설정 화면 진입 시마다 연결 상태 재확인
+        checkServerConnection()
     }
 
     private fun bindViews() {
@@ -157,6 +168,54 @@ class SettingsActivity : AppCompatActivity() {
 
         serverUrlInput  = findViewById(R.id.serverUrlInput)
         saveUrlButton   = findViewById(R.id.saveUrlButton)
+        settingsConnectionDot    = findViewById(R.id.settingsConnectionDot)
+        settingsConnectionStatus = findViewById(R.id.settingsConnectionStatus)
+    }
+
+    /**
+     * 서버 /health 호출로 실시간 연결 상태 확인.
+     * 결과에 따라 좌측 상단 점·텍스트 색상 갱신.
+     */
+    private fun checkServerConnection() {
+        val url = RemoteDetector.SERVER_URL.ifBlank { SplashActivity.DEFAULT_SERVER_URL }
+        val healthUrl = url.trimEnd('/')
+            .replace(Regex("/(detect|segment|signal|fast|health|assistant)$"), "") + "/health"
+
+        // 우선 "확인 중" 상태로
+        runOnUiThread {
+            settingsConnectionDot.backgroundTintList =
+                android.content.res.ColorStateList.valueOf(0xFF9CA3AF.toInt())
+            settingsConnectionStatus.text = "확인 중..."
+            settingsConnectionStatus.setTextColor(0xFF9CA3AF.toInt())
+        }
+
+        Thread {
+            val ok = try {
+                val client = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(3, TimeUnit.SECONDS)
+                    .readTimeout(3, TimeUnit.SECONDS)
+                    .build()
+                val resp = client.newCall(
+                    okhttp3.Request.Builder().url(healthUrl).get().build()
+                ).execute()
+                resp.isSuccessful.also { resp.close() }
+            } catch (e: Exception) { false }
+
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                if (ok) {
+                    settingsConnectionDot.backgroundTintList =
+                        android.content.res.ColorStateList.valueOf(0xFF22C55E.toInt())
+                    settingsConnectionStatus.text = "연결됨"
+                    settingsConnectionStatus.setTextColor(0xFF22C55E.toInt())
+                } else {
+                    settingsConnectionDot.backgroundTintList =
+                        android.content.res.ColorStateList.valueOf(0xFFEF4444.toInt())
+                    settingsConnectionStatus.text = "연결 안됨"
+                    settingsConnectionStatus.setTextColor(0xFFEF4444.toInt())
+                }
+            }
+        }.start()
     }
 
     private fun loadSettings() {
@@ -262,6 +321,7 @@ class SettingsActivity : AppCompatActivity() {
             if (url.isNotEmpty()) {
                 prefs.edit().putString(SplashActivity.KEY_SERVER_URL, url).apply()
                 RemoteDetector.SERVER_URL = url
+                checkServerConnection()  // 새 URL로 즉시 재확인
             }
         }
     }

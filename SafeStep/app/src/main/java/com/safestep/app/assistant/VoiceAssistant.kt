@@ -113,12 +113,22 @@ class VoiceAssistant(
         }
     }
 
-    /** 액티비티 onDestroy 에서 호출. */
+    /**
+     * 액티비티 onDestroy 에서 호출.
+     * 순서 중요:
+     *  1) TTS 즉시 정지 (현재 발화 차단)
+     *  2) 리스너 해제 (콜백 안 들어오게)
+     *  3) scope 취소 (대기 중인 코루틴 중단)
+     *  4) recognizer 정지/해제
+     *  5) TTS shutdown
+     */
     fun release() {
-        scope.cancel()
-        recognizer.destroy()
-        if (ttsReady) tts.stop()
-        tts.shutdown()
+        runCatching { if (ttsReady) tts.stop() }
+        runCatching { recognizer.setRecognitionListener(null) }
+        runCatching { scope.cancel() }
+        runCatching { recognizer.cancel() }
+        runCatching { recognizer.destroy() }
+        runCatching { tts.shutdown() }
     }
 
     // ────────────────────────────────────────────────────

@@ -39,12 +39,12 @@ class SignalClient(serverUrl: String) {
         private const val CROP_TOP_RATIO = 0.50f
     }
 
-    // SERVER_URL 형식이 http://host:port/detect 등 다양할 수 있어서 베이스만 추출
-    private val signalUrl = serverUrl
-        .trimEnd('/')
-        .substringBeforeLast("/detect")
-        .substringBeforeLast("/segment")
-        .substringBeforeLast("/signal") + "/signal"
+    // SERVER_URL 의 베이스만 추출 (/detect, /segment, /signal 등 어느 엔드포인트가 와도 견고)
+    private val signalUrl: String = run {
+        val trimmed = serverUrl.trimEnd('/')
+        val baseUrl = trimmed.replace(Regex("/(detect|segment|signal|fast|health|assistant)$"), "")
+        "$baseUrl/signal"
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(3, TimeUnit.SECONDS)

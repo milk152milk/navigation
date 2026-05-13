@@ -10,6 +10,7 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.tts.TextToSpeech
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.ImageView
@@ -367,16 +368,26 @@ class VideoTestActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }, 3000)
     }
 
+    @Volatile private var ttsReady = false
+
     private fun speak(text: String) {
+        if (!ttsReady) return  // TTS 초기화 실패 또는 진행 중이면 무시
         val now = SystemClock.elapsedRealtime()
         if (text == lastSpoken && now - lastSpeakMs < SPEAK_COOLDOWN_MS) return
         lastSpoken = text
         lastSpeakMs = now
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "safestep-video-$now")
+        runCatching {
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "safestep-video-$now")
+        }
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) tts.language = Locale.KOREAN
+        if (status == TextToSpeech.SUCCESS) {
+            tts.language = Locale.KOREAN
+            ttsReady = true
+        } else {
+            Log.w("VideoTestActivity", "TTS 초기화 실패 (status=$status)")
+        }
     }
 
     /**

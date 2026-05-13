@@ -47,6 +47,7 @@ import com.safestep.app.detect.Detection
 import com.safestep.app.detect.ObjectDetector
 import com.safestep.app.detect.RemoteDetector
 import com.safestep.app.detect.SegmentationClient
+import com.safestep.app.detect.SignalClient
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.safestep.app.navigation.NavigationGuide
 import com.safestep.app.navigation.PoiResult
@@ -99,6 +100,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var detectExecutor: ExecutorService // 탐지 전용 스레드 (cameraExecutor 블로킹 방지)
     private lateinit var segExecutor: ExecutorService    // 세그멘테이션 전용 스레드
     private lateinit var fastExecutor: ExecutorService   // Fast Lane 전용 스레드
+    private lateinit var signalExecutor: ExecutorService // 신호등 감지 전용 스레드
 
     /**
      * "skip-if-busy" 플래그 — 이전 요청이 아직 처리 중이면 새 프레임을 버림.
@@ -107,9 +109,18 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val detectBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val segBusy    = java.util.concurrent.atomic.AtomicBoolean(false)
     private val fastBusy   = java.util.concurrent.atomic.AtomicBoolean(false)  // Fast Lane 전용
+    private val signalBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private var vibrator: Vibrator? = null
     private lateinit var detector: ObjectDetector
-    private lateinit var segClient: SegmentationClient
+    // 클라이언트는 reloadSettings()에서 재할당 가능 → 다중 스레드 안전을 위해 @Volatile
+    @Volatile private lateinit var segClient: SegmentationClient
+    @Volatile private lateinit var signalClient: SignalClient
+    @Volatile private var lastBaseUrlForClients: String = ""  // 서버 URL 변경 감지용
+
+    // 신호등 — 사용자 토글 + 마지막 안내 시각 (중복 발화 방지)
+    @Volatile private var signalEnabled = false
+    @Volatile private var lastTrafficColor: String? = null
+    @Volatile private var lastTrafficSpeakMs = 0L
 
     // ── Location ──────────────────────────────────────────────────────────────
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -217,6 +228,18 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         /** 인도/골목 등 진입 재발화 억제 시간 (세그 깜빡임 대응) */
         private const val SURFACE_ENTRY_SUPPRESS = 45_000L  // 30→45초
 
+        // 프레임 주기 (analyzeFrame 내부 frameCount % N 패턴)
+        private const val FRAME_FAST_INTERVAL    = 2   // Fast Lane: 매 2프레임
+        private const val FRAME_DETECT_INTERVAL  = 4   // 일반 탐지: 매 4프레임
+        private const val FRAME_SEGMENT_INTERVAL = 6   // 노면 세그: 매 6프레임
+        private const val FRAME_SIGNAL_INTERVAL  = 9   // 신호등: 매 9프레임
+        private const val FRAME_HEALTH_INTERVAL  = 300 // 서버 상태 확인: 매 300프레임 (~30초)
+        // 신호등
+        private const val TRAFFIC_LIGHT_COOLDOWN_MS = 5_000L  // 같은 색 반복 안내 쿨다운
+        // 라이프사이클
+        private const val EXECUTOR_SHUTDOWN_TIMEOUT_SEC = 1L  // Executor 종료 대기 시간
+        private const val MAX_AREA_HISTORY_SIZE = 50          // areaHistory 메모리 보호
+
         private val PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -262,6 +285,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         detectExecutor = Executors.newSingleThreadExecutor()
         segExecutor    = Executors.newSingleThreadExecutor()
         fastExecutor   = Executors.newSingleThreadExecutor()
+        signalExecutor = Executors.newSingleThreadExecutor()
         // SharedPreferences에서 설정값 불러와 적용
         val mapPrefs = getSharedPreferences(SplashActivity.PREFS_NAME, MODE_PRIVATE)
         val savedUrl = mapPrefs.getString(SplashActivity.KEY_SERVER_URL, SplashActivity.DEFAULT_SERVER_URL)
@@ -302,7 +326,15 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         detector       = ObjectDetector.create(this)
-        segClient      = SegmentationClient(RemoteDetector.SERVER_URL)
+        // 서버 URL 비어있으면 기본값 사용 (런타임 크래시 방지)
+        val resolvedServerUrl = RemoteDetector.SERVER_URL.ifBlank { SplashActivity.DEFAULT_SERVER_URL }
+        segClient      = SegmentationClient(resolvedServerUrl)
+        signalClient   = SignalClient(resolvedServerUrl)
+        lastBaseUrlForClients = resolvedServerUrl
+        signalEnabled  = mapPrefs.getBoolean(
+            SettingsActivity.KEY_SIGNAL_ENABLED,
+            SettingsActivity.DEFAULT_SIGNAL_ENABLED
+        )
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
         // 나침반 + 이동 감지 센서
@@ -348,6 +380,20 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun reloadSettings() {
         val p = getSharedPreferences(SplashActivity.PREFS_NAME, MODE_PRIVATE)
+
+        // 실험 기능 — 신호등 토글 (실시간 갱신)
+        signalEnabled = p.getBoolean(
+            SettingsActivity.KEY_SIGNAL_ENABLED,
+            SettingsActivity.DEFAULT_SIGNAL_ENABLED
+        )
+
+        // 서버 URL 변경 시 클라이언트 재생성 (설정 화면에서 URL 수정 후 돌아왔을 때)
+        val currentBase = RemoteDetector.SERVER_URL.ifBlank { SplashActivity.DEFAULT_SERVER_URL }
+        if (::segClient.isInitialized && currentBase != lastBaseUrlForClients) {
+            segClient    = SegmentationClient(currentBase)
+            signalClient = SignalClient(currentBase)
+            lastBaseUrlForClients = currentBase
+        }
 
         // 탐지 감도
         val sensIdx = p.getInt(SettingsActivity.KEY_SENSITIVITY, 1)
@@ -438,12 +484,16 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         mainHandler.removeCallbacks(hideBannerRunnable)
         mainHandler.removeCallbacks(statsRunnable)
         mapView.onDetach()
-        cameraExecutor.shutdown()
-        detectExecutor.shutdown()
-        segExecutor.shutdown()
-        fastExecutor.shutdown()
+        shutdownExecutorSafely(cameraExecutor, "camera")
+        shutdownExecutorSafely(detectExecutor, "detect")
+        shutdownExecutorSafely(segExecutor, "seg")
+        shutdownExecutorSafely(fastExecutor, "fast")
+        if (::signalExecutor.isInitialized) shutdownExecutorSafely(signalExecutor, "signal")
         tts.shutdown()
         speechRecognizer?.destroy()
+        // 센서 안전망 — onPause()에서 해제됐어도 onDestroy 직접 호출 시 대비
+        runCatching { sensorManager.unregisterListener(compassListener) }
+        runCatching { sensorManager.unregisterListener(motionListener) }
         if (::fusedLocationClient.isInitialized && ::locationCallback.isInitialized)
             fusedLocationClient.removeLocationUpdates(locationCallback)
         runCatching { detector.close() }
@@ -945,7 +995,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             // 🚀 Fast Lane — 2프레임마다 (배터리 절약: 매 프레임 → 2프레임)
             //    차량·사람 전용 (imgsz=160), 긴급 충돌 경고 우선
-            if (frameCount % 2 == 0 && fastBusy.compareAndSet(false, true)) {
+            if (frameCount % FRAME_FAST_INTERVAL == 0 && fastBusy.compareAndSet(false, true)) {
                 val fastDet = detector as? RemoteDetector
                 if (fastDet != null) {
                     fastExecutor.execute {
@@ -964,7 +1014,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             // ① 일반 탐지 — 4프레임마다 (배터리 절약: 2→4프레임)
-            if (frameCount % 4 == 0 && detectBusy.compareAndSet(false, true)) {
+            if (frameCount % FRAME_DETECT_INTERVAL == 0 && detectBusy.compareAndSet(false, true)) {
                 detectExecutor.execute {
                     try {
                         val detections = detector.detect(corrected, 0)
@@ -978,7 +1028,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             // ④ 서버 연결 30초 주기 확인
-            if (frameCount % 300 == 0) {
+            if (frameCount % FRAME_HEALTH_INTERVAL == 0) {
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastServerCheckMs >= 30_000L) {
                     if (!serverConnected) repeatServerOfflineWarning()
@@ -988,7 +1038,7 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             // ② 세그멘테이션 — 6프레임마다 (배터리 절약: 2→6프레임)
             val vehicleUrgent = SystemClock.elapsedRealtime() < vehicleUrgentUntilMs
-            if (!vehicleUrgent && frameCount % 6 == 0 && segBusy.compareAndSet(false, true)) {
+            if (!vehicleUrgent && frameCount % FRAME_SEGMENT_INTERVAL == 0 && segBusy.compareAndSet(false, true)) {
                 segExecutor.execute {
                     try {
                         val seg = segClient.segment(corrected, 0)
@@ -997,6 +1047,26 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         Log.w(TAG, "세그멘테이션 실패: ${e.message}")
                     } finally {
                         segBusy.set(false)
+                    }
+                }
+            }
+
+            // ③ 신호등 — 횡단보도 또는 차도 인접 시에만 (조건 B + 엄격 조건)
+            //    - 사용자 토글 ON
+            //    - 노면 세그가 "crosswalk" 또는 "road" 일 때 (횡단보도 근처)
+            //    - 9프레임마다 (배터리 절약)
+            //    - vehicleUrgent 중엔 중단
+            if (signalEnabled && !vehicleUrgent && frameCount % FRAME_SIGNAL_INTERVAL == 0 &&
+                (lastSurfaceStatus == "crosswalk" || lastSurfaceStatus == "road") &&
+                signalBusy.compareAndSet(false, true)) {
+                signalExecutor.execute {
+                    try {
+                        val signal = signalClient.detect(corrected, 0)
+                        if (signal != null) handleTrafficLight(signal.color)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "신호등 감지 실패: ${e.message}")
+                    } finally {
+                        signalBusy.set(false)
                     }
                 }
             }
@@ -1027,6 +1097,13 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         lastDetectionMs = nowMs
         bboxOverlay.updateDetections(detections)
         areaHistory.entries.removeAll { (_, h) -> h.isEmpty() || nowMs - h.last().second > 5_000L }
+        // 메모리 보호: 동시 추적 라벨이 상한 넘으면 오래된 것부터 제거
+        if (areaHistory.size > MAX_AREA_HISTORY_SIZE) {
+            areaHistory.entries
+                .sortedBy { it.value.firstOrNull()?.second ?: 0L }
+                .take(areaHistory.size - MAX_AREA_HISTORY_SIZE)
+                .forEach { areaHistory.remove(it.key) }
+        }
 
         // ── 탐지별 경고 후보 계산 ─────────────────────────────────────────────
         data class Candidate(val det: Detection, val level: WarnLevel, val amp: Int, val side: String)
@@ -1251,6 +1328,58 @@ class MapActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 onCrosswalk = false
                 tts.speak("주의구역입니다. 천천히 이동하세요.", TextToSpeech.QUEUE_ADD, null, "caution")
             }
+        }
+    }
+
+    /**
+     * Executor 안전 종료 — 1초 대기 후 강제 shutdownNow.
+     * Activity 종료 시 대기 중인 작업으로 리소스 누수 방지.
+     */
+    private fun shutdownExecutorSafely(executor: ExecutorService, name: String) {
+        runCatching {
+            executor.shutdown()
+            if (!executor.awaitTermination(EXECUTOR_SHUTDOWN_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)) {
+                executor.shutdownNow()
+                Log.w(TAG, "Executor $name: ${EXECUTOR_SHUTDOWN_TIMEOUT_SEC}초 내 종료 안 됨, 강제 종료")
+            }
+        }
+    }
+
+    /**
+     * 신호등 색상 결과 처리 — 횡단보도 컨텍스트에서만 호출됨 (analyzeFrame 가드).
+     *
+     * 추가 안전장치:
+     *   - 요청 전송 시점과 응답 시점 사이에 노면 상태가 바뀔 수 있어 재확인
+     *   - 같은 색이 연속이면 5초 쿨다운
+     *   - null 색은 무시
+     *   - QUEUE_ADD 사용해 다른 안내(횡단보도 진입 등)와 겹치지 않게
+     */
+    private fun handleTrafficLight(color: String?) {
+        if (color == null) return
+
+        // 사용자가 토글 OFF 했으면 응답 도착해도 무시
+        if (!signalEnabled) return
+
+        // 응답 도착 시점에 컨텍스트 재확인 — 사용자가 횡단보도 벗어났으면 무시
+        if (lastSurfaceStatus != "crosswalk" && lastSurfaceStatus != "road") return
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val sameColor = (color == lastTrafficColor)
+
+        // 같은 색 연속이면 쿨다운 적용
+        if (sameColor && nowMs - lastTrafficSpeakMs < TRAFFIC_LIGHT_COOLDOWN_MS) return
+
+        lastTrafficColor = color
+        lastTrafficSpeakMs = nowMs
+
+        val message = when (color) {
+            "red"      -> "빨간불입니다. 멈추세요."
+            "green"    -> "초록불입니다. 건너세요."
+            "blinking" -> "신호가 깜빡입니다. 다음 신호를 기다리세요."
+            else       -> return
+        }
+        runOnUiThread {
+            tts.speak(message, TextToSpeech.QUEUE_ADD, null, "traffic-light-$nowMs")
         }
     }
 

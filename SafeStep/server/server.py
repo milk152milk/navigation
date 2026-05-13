@@ -321,6 +321,12 @@ def _calc_approach_speed(group: str, min_depth: float) -> float | None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _TRAFFIC_LIGHT_CLASS = 9   # COCO class id
 
+# /signal 엔드포인트 엄격 조건 (오탐 방지)
+_SIGNAL_MIN_CONF      = 0.30   # YOLO confidence 최소
+_SIGNAL_ASPECT_MIN    = 0.4    # 박스 종횡비 (w/h) 최소
+_SIGNAL_ASPECT_MAX    = 3.0    # 박스 종횡비 최대
+_SIGNAL_MIN_AREA_RATIO = 0.002 # 박스 면적 / 이미지 면적 최소
+
 
 def _detect_light_color(img_bgr: np.ndarray,
                         x1: int, y1: int, x2: int, y2: int) -> str | None:
@@ -752,27 +758,36 @@ async def signal(file: UploadFile = File(...)):
     best_color: str | None = None
     best_conf              = 0.0
 
-    # ── 1차: YOLO 탐지 ─────────────────────────────────────────────────────
+    # ── YOLO 탐지 + 엄격한 검증 (오탐 방지) ──────────────────────────────
+    # 빨간 차/간판/표지판 등이 신호등으로 오인되는 것을 막기 위해
+    # 다음 모든 조건을 만족해야 신호등으로 인정:
+    #   1. YOLO conf ≥ 0.30
+    #   2. 박스 종횡비 0.4~3.0 (신호등 모양)
+    #   3. 박스 면적 ≥ 이미지 0.2% (너무 멀면 무시)
+    # 폴백(블롭 스캔)은 사용 안 함 — 컨텍스트 없는 빨간색 잡으면 안 됨
+    img_area = img_bgr.shape[0] * img_bgr.shape[1]
     if signal_model is not None:
         results = signal_model(image, imgsz=640, classes=[_TRAFFIC_LIGHT_CLASS],
                                verbose=False, half=_half)
         for result in results:
             for box in result.boxes:
                 conf = float(box.conf[0])
-                if conf < 0.15:
+                if conf < _SIGNAL_MIN_CONF:    # 조건 ① conf 임계값
                     continue
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                w_box = x2 - x1
+                h_box = y2 - y1
+                if w_box <= 0 or h_box <= 0:
+                    continue
+                aspect = w_box / h_box
+                if not (_SIGNAL_ASPECT_MIN <= aspect <= _SIGNAL_ASPECT_MAX):  # 조건 ② 종횡비
+                    continue
+                if (w_box * h_box) / img_area < _SIGNAL_MIN_AREA_RATIO:        # 조건 ③ 최소 면적
+                    continue
                 color = _detect_light_color(img_bgr, x1, y1, x2, y2)
                 if color is not None and conf > best_conf:
                     best_color = color
                     best_conf  = conf
-
-    # ── 2차: 블롭 스캔 폴백 (YOLO가 신호등을 못 잡았을 때) ──────────────────
-    if best_color is None:
-        blob_color, blob_conf = _scan_for_light_blob(img_bgr, top_ratio=0.55)
-        if blob_color is not None:
-            best_color = blob_color
-            best_conf  = blob_conf * 0.75   # YOLO 탐지보다 신뢰도 낮게 설정
 
     _light_history.append(best_color)
     final_color = _traffic_light_status()

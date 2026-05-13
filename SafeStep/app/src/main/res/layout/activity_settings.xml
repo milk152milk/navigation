@@ -361,6 +361,7 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:checked="true"
+                            android:contentDescription="음성 어시스턴트 켜기 끄기"
                             android:thumbTint="#FF6B00"
                             android:trackTint="#FFD5B0" />
                     </LinearLayout>
@@ -375,13 +376,14 @@
                             android:layout_weight="1"
                             android:orientation="vertical">
                             <TextView style="@style/RowTitle" android:text="신호등 감지" />
-                            <TextView style="@style/RowSub" android:text="실험 기능 — 인식률이 낮을 수 있습니다" />
+                            <TextView style="@style/RowSub" android:text="빨강·초록 신호등 색상 감지 (HSV)" />
                         </LinearLayout>
                         <Switch
                             android:id="@+id/switchSignalEnabled"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:checked="false"
+                            android:contentDescription="신호등 감지 켜기 끄기"
                             android:thumbTint="#FF6B00"
                             android:trackTint="#FFD5B0" />
                     </LinearLayout>

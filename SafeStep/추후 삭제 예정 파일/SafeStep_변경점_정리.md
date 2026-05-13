@@ -2,7 +2,8 @@
 
 > **기준 코드**: `C:\Users\User\github\navigation\준범\SafeStep` (이전 분석본)
 > **적용 위치**: `C:\Users\User\github\SafeStep`
-> **작성일**: 2026-05-11
+> **최초 작성**: 2026-05-11
+> **최종 업데이트**: 2026-05-13 (옵션 C, VideoTestActivity 풀 업그레이드, 연결 상태 실시간 확인 추가)
 > **목적**: 다음 작업자(Claude 또는 사람)가 무엇이 바뀌었는지 빠르게 파악
 
 ---
@@ -12,11 +13,11 @@
 | 영역 | 변경 수 | 빌드 영향 |
 |------|--------|---------|
 | 🔧 빌드 에러 수정 | 1건 (VideoTestActivity 보완) | ❗ 필수 |
-| 🆕 신규 기능 | Feature Flags + 토글 UI + 신호등 컨텍스트 가드 | 큼 |
-| 🔥 정합성·UX | 7건 적용 | 안정성 ↑ |
-| 🥇 라이프사이클·동시성 | 5건 적용 | 누수 차단 |
-| 🥈 성능 | 1건 적용 (메모리 보호) | 안정성 ↑ |
-| 🥉 경량화 | 3건 적용 (상수화) | 가독성 ↑ |
+| 🆕 신규 기능 (5/11~13 작업) | Feature Flags + 사용자 UI 토글 + 신호등 통합 + VideoTestActivity 풀 업그레이드 + 설정 화면 실시간 연결 확인 | 큼 |
+| 🔥 정합성·UX | 7건 + α (handleTrafficLight 컨텍스트·signalEnabled 가드 등) | 안정성 ↑ |
+| 🥇 라이프사이클·동시성 | 5건 (Executor shutdown 타임아웃, VoiceAssistant release 순서, @Volatile clients 등) | 누수 차단 |
+| 🥈 성능 | 1건 (memoryguard) | 안정성 ↑ |
+| 🥉 경량화 | 3건 (상수화) | 가독성 ↑ |
 | 🪶 보안·문서 | 0건 (기존 처리 충분) | — |
 
 ---
@@ -77,6 +78,35 @@ object FeatureFlags {
 - 박스 종횡비 **0.4 ~ 3.0** (신호등 모양 검증)
 - 박스 면적 ≥ 이미지 **0.2%** (멀어서 작은 건 무시)
 - `ENABLE_SIGNAL = True` (모델 로드 유지, 클라이언트가 호출 여부 결정)
+
+### 1-5. VideoTestActivity 풀 업그레이드 (5/13 추가)
+
+**수정**: `app/src/main/java/com/safestep/app/VideoTestActivity.kt`
+
+기존 단일 Thread 직렬 처리 → **MapActivity와 동일 병렬 파이프라인**.
+
+추가된 것:
+- `SignalClient` import + 인스턴스
+- 4개 Executor (`fastExecutor`, `detectExecutor`, `segExecutor`, `signalExecutor`)
+- 4개 AtomicBoolean (skip-if-busy)
+- `signalEnabled` 토글 + 횡단보도/차도 컨텍스트 가드
+- `handleTrafficLight()` 함수 (MapActivity와 동일 로직)
+- `extractAndDetect()` 재작성 — Fast Lane 매 프레임 + Detect 매 프레임 + Segment 2프레임마다 + Signal 3프레임마다
+- `onResume()` 추가 — 설정에서 토글 변경 시 즉시 반영
+- `onDestroy()` 4개 Executor 안전 종료
+
+→ 동영상 모드도 실시간 카메라와 거의 동일한 분석 능력.
+
+### 1-6. 설정 화면 연결 상태 실시간 확인 (5/13 추가)
+
+**수정**:
+- `app/src/main/res/layout/activity_settings.xml` — `settingsConnectionDot`, `settingsConnectionStatus` ID 부여, 초기값 회색 "확인 중..."
+- `app/src/main/java/com/safestep/app/SettingsActivity.kt` — `checkServerConnection()` 함수 추가
+
+기존: "연결됨"이 XML에 하드코딩 (항상 초록색)
+변경: `/health` 호출로 실제 연결 확인 → 회색→초록 또는 빨강
+- `onCreate()` + `onResume()` 진입 시마다 확인
+- 서버 URL 저장 시 즉시 재확인
 
 ---
 
@@ -159,6 +189,25 @@ private val signalUrl: String = run {
 
 - `switchLlmEnabled` → `contentDescription="음성 어시스턴트 켜기 끄기"`
 - `switchSignalEnabled` → `contentDescription="신호등 감지 켜기 끄기"`
+
+### 3-8. handleTrafficLight signalEnabled 가드 (5/13 추가)
+
+**수정**: `MapActivity.kt:handleTrafficLight()` + `VideoTestActivity.kt:handleTrafficLight()`
+
+사용자가 도중에 토글 OFF 했을 경우, 요청 후 도착한 응답도 무시:
+```kotlin
+if (!signalEnabled) return
+if (lastSurfaceStatus != "crosswalk" && lastSurfaceStatus != "road") return
+```
+
+QUEUE_FLUSH → QUEUE_ADD 변경 (다른 안내 안 끊음).
+
+### 3-9. 설정 화면 부제목 명확화 (5/13 추가)
+
+**수정**: `activity_settings.xml`
+
+- 음성 어시스턴트: "화면 길게 누르면 자연어 명령 (LLM)"
+- 신호등 감지: "빨강·초록 신호등 색상 감지 (HSV)" ← "실험 기능 — 인식률 낮음" 보다 명확
 
 ---
 

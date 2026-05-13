@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 우상단 L자 브래킷 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 위 가로선 -->
+    <item android:bottom="17dp">
+        <shape>
+            <solid android:color="#CCFFFFFF" />
+        </shape>
+    </item>
+    <!-- 오른쪽 세로선 -->
+    <item android:left="17dp">
+        <shape>
+            <solid android:color="#CCFFFFFF" />
+        </shape>
+    </item>
+</layer-list>
